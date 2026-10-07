@@ -3205,6 +3205,14 @@ fn publish_embedded_linux_frame(
 }
 
 #[cfg(target_os = "linux")]
+fn embedded_linux_publish_poll_interval(value: Option<&str>) -> std::time::Duration {
+    std::time::Duration::from_millis(match value {
+        Some("1") => 1,
+        _ => 2,
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn run_embedded_linux_monitor(
     shared: Arc<SharedPipeline>,
     publisher: crate::GraphicsFramePublisher,
@@ -3213,6 +3221,11 @@ fn run_embedded_linux_monitor(
 ) {
     use std::time::Duration;
 
+    let publish_poll_interval = embedded_linux_publish_poll_interval(
+        std::env::var("OPENNOW_EMBEDDED_PUBLISH_POLL_MS")
+            .ok()
+            .as_deref(),
+    );
     let mut playback_started = false;
     let mut last_decode_timings_report = Instant::now();
     let mut reported_color = None;
@@ -3389,7 +3402,7 @@ fn run_embedded_linux_monitor(
                 | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
-        thread::sleep(Duration::from_millis(2));
+        thread::sleep(publish_poll_interval);
     }
     stop_linux_session(&shared);
 }
@@ -4380,6 +4393,27 @@ fn mark_macos_video_desynced(shared: &SharedPipeline, mid: &str, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedded_publish_poll_is_opt_in_and_rejects_unbounded_rates() {
+        let baseline = std::time::Duration::from_millis(2);
+        assert_eq!(
+            embedded_linux_publish_poll_interval(Some("1")),
+            baseline / 2
+        );
+        for value in [
+            None,
+            Some("2"),
+            Some("0"),
+            Some("3"),
+            Some("-1"),
+            Some(""),
+            Some("1ms"),
+        ] {
+            assert_eq!(embedded_linux_publish_poll_interval(value), baseline);
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
