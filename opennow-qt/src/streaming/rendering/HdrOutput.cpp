@@ -118,7 +118,9 @@ void HdrOutput::publish(State state)
         state.supported = state.supported && wayland.supported;
 #endif
         DisplayData next;
-        if (wayland.supported) {
+        // A primary-volume fallback proves HDR encoding support, but supplies
+        // no display brightness measurement to advertise to the streaming core.
+        if (wayland.supported && wayland.targetLuminanceProvided) {
             next.available = true;
             next.minimumNits = double(wayland.targetMinimumNits);
             next.maximumNits = double(wayland.targetMaximumNits);
