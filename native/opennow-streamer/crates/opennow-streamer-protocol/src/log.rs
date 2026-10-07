@@ -233,6 +233,36 @@ pub fn message_summary(value: &serde_json::Value) -> String {
         }
     }
     if value["type"] == "telemetry" {
+        for key in [
+            "framesPerSecond",
+            "bitrateMbps",
+            "receiveBitrateMbps",
+            "peakBitrateMbps",
+            "pingMs",
+            "jitterMs",
+            "packetLossPercent",
+            "decodeTimeMs",
+            "decoderResidenceMs",
+        ] {
+            if let Some(number) = value
+                .get(key)
+                .filter(|number| number.as_f64().is_some_and(f64::is_finite))
+            {
+                fields.push(format!("{key}={number}"));
+            }
+        }
+        for stage in ["call", "residence"] {
+            for key in ["p50", "p95", "max"] {
+                if let Some(number) = value
+                    .get("decodeTimings")
+                    .and_then(|timings| timings.get(stage))
+                    .and_then(|timings| timings.get(key))
+                    .filter(|number| number.as_f64().is_some_and(f64::is_finite))
+                {
+                    fields.push(format!("decodeTimings.{stage}.{key}={number}"));
+                }
+            }
+        }
         if let Some(stage @ ("tracking" | "keyframe-pending" | "recovery-required")) =
             value["decodeProgressStage"].as_str()
         {
@@ -405,6 +435,15 @@ mod tests {
     fn telemetry_summaries_preserve_typed_pipeline_progress() {
         let summary = message_summary(&serde_json::json!({
             "type": "telemetry",
+            "framesPerSecond": 60.0,
+            "bitrateMbps": 40.3,
+            "receiveBitrateMbps": 44.9,
+            "peakBitrateMbps": 48.5,
+            "pingMs": 67.0,
+            "jitterMs": 0.25,
+            "packetLossPercent": 0.0,
+            "decodeTimeMs": 7.4,
+            "decoderResidenceMs": 7.5,
             "decodeProgressStage": "keyframe-pending",
             "transportFrameProgressStalled": false,
             "frameStageTimings": {
@@ -416,10 +455,27 @@ mod tests {
             "decodeTimings": {
                 "epoch": 2, "submissionsTotal": 850, "outputsTotal": 820,
                 "outputCallsTotal": 800, "inFlight": 30,
-                "unmatchedOutputs": 1, "unmatchedSubmissions": 2
+                "unmatchedOutputs": 1, "unmatchedSubmissions": 2,
+                "call": {"p50": 7.4, "p95": 8.0, "max": 9.5},
+                "residence": {"p50": 7.5, "p95": 8.5, "max": 10.0}
             }
         }));
         for field in [
+            "framesPerSecond=60.0",
+            "bitrateMbps=40.3",
+            "receiveBitrateMbps=44.9",
+            "peakBitrateMbps=48.5",
+            "pingMs=67.0",
+            "jitterMs=0.25",
+            "packetLossPercent=0.0",
+            "decodeTimeMs=7.4",
+            "decoderResidenceMs=7.5",
+            "decodeTimings.call.p50=7.4",
+            "decodeTimings.call.p95=8.0",
+            "decodeTimings.call.max=9.5",
+            "decodeTimings.residence.p50=7.5",
+            "decodeTimings.residence.p95=8.5",
+            "decodeTimings.residence.max=10.0",
             "decodeProgressStage=keyframe-pending",
             "transportFrameProgressStalled=false",
             "frameStageTimings.assembledFramesTotal=900",
@@ -573,6 +629,50 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_numeric_summaries_reject_payloads_and_wrong_types() {
+        for invalid in [
+            serde_json::json!("67.0"),
+            serde_json::json!("secret"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!([67]),
+            serde_json::json!({"token": "secret"}),
+            serde_json::json!(f64::INFINITY),
+            serde_json::json!(f64::NAN),
+        ] {
+            let summary = message_summary(&serde_json::json!({
+                "type": "telemetry",
+                "framesPerSecond": invalid, "bitrateMbps": invalid,
+                "receiveBitrateMbps": invalid, "peakBitrateMbps": invalid,
+                "pingMs": invalid, "jitterMs": invalid, "packetLossPercent": invalid,
+                "decodeTimeMs": invalid, "decoderResidenceMs": invalid,
+                "decodeTimings": {
+                    "call": {"p50": invalid, "p95": invalid, "max": invalid},
+                    "residence": {"p50": invalid, "p95": invalid, "max": invalid}
+                }
+            }));
+            assert_eq!(summary, "type=telemetry");
+        }
+        let mut telemetry = serde_json::json!({
+            "type": "telemetry", "pingMs": 67,
+            "decodeTimings": {"call": {"p50": 7.4}, "residence": {"p95": 8.5}}
+        });
+        let summary = message_summary(&telemetry);
+        telemetry["token"] = serde_json::json!("secret".repeat(10_000));
+        telemetry["privateCounter"] = serde_json::json!(123);
+        telemetry["decodeTimings"]["call"]["token"] = serde_json::json!("private");
+        telemetry["decodeTimings"]["call"]["p99"] = serde_json::json!(123);
+        telemetry["decodeTimings"]["residence"]["path"] = serde_json::json!("/private/file");
+        assert_eq!(message_summary(&telemetry), summary);
+        assert_eq!(
+            summary,
+            "type=telemetry pingMs=67 decodeTimings.call.p50=7.4 decodeTimings.residence.p95=8.5"
+        );
+        telemetry["type"] = serde_json::json!("log");
+        assert_eq!(message_summary(&telemetry), "type=log");
+    }
+
+    #[test]
     fn pipeline_summary_size_is_bounded_and_missing_values_stay_unavailable() {
         let mut telemetry = serde_json::json!({"type": "telemetry"});
         assert_eq!(message_summary(&telemetry), "type=telemetry");
@@ -589,9 +689,27 @@ mod tests {
         });
         telemetry["decodeProgressStage"] = serde_json::json!("recovery-required");
         telemetry["transportFrameProgressStalled"] = serde_json::json!(true);
+        for key in [
+            "framesPerSecond",
+            "bitrateMbps",
+            "receiveBitrateMbps",
+            "peakBitrateMbps",
+            "pingMs",
+            "jitterMs",
+            "packetLossPercent",
+            "decodeTimeMs",
+            "decoderResidenceMs",
+        ] {
+            telemetry[key] = serde_json::json!(f64::MAX);
+        }
+        for stage in ["call", "residence"] {
+            telemetry["decodeTimings"][stage] = serde_json::json!({
+                "p50": f64::MAX, "p95": f64::MAX, "max": f64::MAX
+            });
+        }
         let summary = message_summary(&telemetry);
-        assert!(summary.len() < 1024, "{}", summary.len());
-        assert_eq!(summary.split(' ').count(), 17);
+        assert!(summary.len() < 2048, "{}", summary.len());
+        assert_eq!(summary.split(' ').count(), 32);
         assert!(summary.contains(&format!("decodeTimings.outputsTotal={}", u64::MAX)));
         telemetry["decodeTimings"]["private"] = serde_json::json!("secret".repeat(10_000));
         assert_eq!(message_summary(&telemetry), summary);

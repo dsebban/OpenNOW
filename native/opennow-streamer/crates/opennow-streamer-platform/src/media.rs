@@ -3188,6 +3188,23 @@ fn run_embedded_linux_audio(shared: Arc<SharedPipeline>) {
 }
 
 #[cfg(target_os = "linux")]
+fn publish_embedded_linux_frame(
+    publisher: &crate::GraphicsFramePublisher,
+    lease: crate::GraphicsContextLease,
+    frame: Arc<crate::LinuxGpuFrame>,
+    feedback: &Sender<MediaFeedback>,
+) -> Result<crate::GraphicsPublishOutcome, crate::GraphicsRuntimeError> {
+    let outcome = publisher.publish(lease, frame)?;
+    if outcome == crate::GraphicsPublishOutcome::Replaced {
+        let _ = feedback.send(MediaFeedback::QueueDropped {
+            media: "video-mailbox",
+            count: 1,
+        });
+    }
+    Ok(outcome)
+}
+
+#[cfg(target_os = "linux")]
 fn run_embedded_linux_monitor(
     shared: Arc<SharedPipeline>,
     publisher: crate::GraphicsFramePublisher,
@@ -3261,9 +3278,13 @@ fn run_embedded_linux_monitor(
                         .frame(decoded)
                         .map_err(|error| error.to_string())
                         .and_then(|frame| {
-                            publisher
-                                .publish(lease, Arc::new(frame))
-                                .map_err(|error| error.to_string())
+                            publish_embedded_linux_frame(
+                                &publisher,
+                                lease,
+                                Arc::new(frame),
+                                &shared.feedback,
+                            )
+                            .map_err(|error| error.to_string())
                         }) {
                         Ok(_) if !playback_started => {
                             playback_started = true;
@@ -4359,6 +4380,77 @@ fn mark_macos_video_desynced(shared: &SharedPipeline, mid: &str, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedded_linux_mailbox_reports_only_replaced_frames() {
+        use opennow_streamer_platform_linux::{DecodedVideoFrame, FramePlane, StreamFormat};
+
+        let (graphics, publisher) = crate::RenderThreadGraphics::new(|| {});
+        graphics
+            .initialize(crate::GraphicsContext {
+                api: crate::GraphicsApi::Vulkan,
+                instance: 1,
+                physical_device: 2,
+                device: 3,
+                queue: 4,
+                queue_family_index: 0,
+                vulkan_dmabuf_import_enabled: false,
+                vulkan_dmabuf_buffer_import_enabled: false,
+            })
+            .unwrap();
+        let lease = publisher.context().unwrap();
+        let producer = crate::LinuxGpuFrameProducer::new(3).unwrap();
+        // CPU-backed fixtures exercise mailbox ownership without creating a GPU device.
+        let frame = Arc::new(
+            producer
+                .frame(DecodedVideoFrame {
+                    format: StreamFormat::video_default(4, 4).unwrap(),
+                    planes: vec![
+                        FramePlane {
+                            data: Arc::from(vec![16_u8; 16]),
+                            stride: 4,
+                            rows: 4,
+                        },
+                        FramePlane {
+                            data: Arc::from(vec![128_u8; 8]),
+                            stride: 4,
+                            rows: 2,
+                        },
+                    ],
+                    dmabuf: None,
+                    vulkan: None,
+                    timestamp_us: 42,
+                })
+                .unwrap(),
+        );
+        let (feedback, receiver) = std::sync::mpsc::channel();
+        assert_eq!(
+            publish_embedded_linux_frame(&publisher, lease, Arc::clone(&frame), &feedback).unwrap(),
+            crate::GraphicsPublishOutcome::Published
+        );
+        assert!(receiver.try_recv().is_err());
+        for _ in 0..2 {
+            assert_eq!(
+                publish_embedded_linux_frame(&publisher, lease, Arc::clone(&frame), &feedback)
+                    .unwrap(),
+                crate::GraphicsPublishOutcome::Replaced
+            );
+            assert_eq!(
+                receiver.try_recv().unwrap(),
+                MediaFeedback::QueueDropped {
+                    media: "video-mailbox",
+                    count: 1,
+                }
+            );
+        }
+        drop(graphics.acquire_latest().unwrap());
+        publish_embedded_linux_frame(&publisher, lease, Arc::clone(&frame), &feedback).unwrap();
+        assert!(receiver.try_recv().is_err());
+        graphics.shutdown().unwrap();
+        assert!(publish_embedded_linux_frame(&publisher, lease, frame, &feedback).is_err());
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

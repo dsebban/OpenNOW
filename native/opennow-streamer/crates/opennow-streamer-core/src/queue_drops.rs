@@ -54,9 +54,8 @@ impl QueueDropReports {
 fn queue_drop_event(media: &str, count: usize) -> Value {
     let unit = match media {
         "video" | "d3d11-video" | "d3d11-decode" | "present" | "linux-present" | "videotoolbox"
-        | "videotoolbox-hevc" | "videotoolbox-av1" | "video-decode" | "video-presentation" => {
-            "frames"
-        }
+        | "videotoolbox-hevc" | "videotoolbox-av1" | "video-decode" | "video-presentation"
+        | "decoded-video" | "video-mailbox" => "frames",
         "audio-output" => "samples",
         "audio" | "wasapi" | "linux-audio" | "coreaudio" => "packets",
         _ => "items",
@@ -98,6 +97,8 @@ mod tests {
                     "videotoolbox-av1",
                     "video-decode",
                     "video-presentation",
+                    "decoded-video",
+                    "video-mailbox",
                 ][..],
                 "frames",
             ),
@@ -133,6 +134,10 @@ mod tests {
         let now = reports.last_flush;
         reports.record("video", 3);
         reports.record("video", 4);
+        reports.record("decoded-video", 2);
+        reports.record("decoded-video", 3);
+        reports.record("video-mailbox", 1);
+        reports.record("video-mailbox", 1);
         reports.record("audio-output", 96_000);
         reports.record("audio", 2);
         reports.record("unknown", 0);
@@ -142,6 +147,12 @@ mod tests {
         let delivered: HashMap<_, _> = receiver
             .try_iter()
             .map(|value| {
+                if matches!(
+                    value["media"].as_str(),
+                    Some("decoded-video" | "video-mailbox")
+                ) {
+                    assert_eq!(value["unit"], "frames");
+                }
                 (
                     value["media"].as_str().unwrap().to_owned(),
                     value["count"].as_u64().unwrap(),
@@ -152,6 +163,8 @@ mod tests {
             delivered,
             HashMap::from([
                 ("video".to_owned(), 7),
+                ("decoded-video".to_owned(), 5),
+                ("video-mailbox".to_owned(), 2),
                 ("audio-output".to_owned(), 96_000),
                 ("audio".to_owned(), 2),
             ])

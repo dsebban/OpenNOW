@@ -80,3 +80,22 @@ decode delay, and display delay require separate measurements.
 
 Private packet captures, credentials, session identifiers, keys, and private
 diagnostic exports are excluded from this public fork.
+
+## Diagnostic implementation
+
+This branch now counts decoded-video queue overflow in frame units, reports
+replaced GPU-mailbox frames as a separate `video-mailbox` source, and retains
+bounded numeric latency/bitrate/decode percentile fields in telemetry logs.
+The publisher reports a replacement only after a successful `Replaced` result;
+normal admission, consumed frames and publisher errors do not increment it.
+
+These are measurement changes. They do not establish reduced latency or fewer
+drops, and the HUD total still combines several local queue sources. Physical
+scanout loss and network loss need separate measurements. No protocol deadline,
+frame scheduler, credential handling, codec selection or FFI version changed.
+
+Authenticated discovery and five repeated endpoint preflight rounds checked
+24 NVIDIA regions on the NucBox. Germany was lowest at a 60 ms median, followed
+by Netherlands South/North at 64/65 ms. These are TCP-connect round means, not
+in-stream UDP or gameplay results. Private runtime data and account metadata
+are excluded from the fork.
