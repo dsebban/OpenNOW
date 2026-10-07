@@ -3213,6 +3213,11 @@ fn embedded_linux_publish_poll_interval(value: Option<&str>) -> std::time::Durat
 }
 
 #[cfg(target_os = "linux")]
+fn embedded_linux_ready_wake_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(target_os = "linux")]
 fn run_embedded_linux_monitor(
     shared: Arc<SharedPipeline>,
     publisher: crate::GraphicsFramePublisher,
@@ -3226,6 +3231,19 @@ fn run_embedded_linux_monitor(
             .ok()
             .as_deref(),
     );
+    let ready_wake = embedded_linux_ready_wake_enabled(
+        std::env::var("OPENNOW_EMBEDDED_READY_WAKE").ok().as_deref(),
+    );
+    let readiness = if ready_wake {
+        shared
+            .linux_session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(opennow_streamer_platform_linux::LinuxSession::frame_readiness)
+    } else {
+        None
+    };
     let mut playback_started = false;
     let mut last_decode_timings_report = Instant::now();
     let mut reported_color = None;
@@ -3402,7 +3420,15 @@ fn run_embedded_linux_monitor(
                 | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
-        thread::sleep(publish_poll_interval);
+        if let Some(readiness) = &readiness {
+            if readiness.wait(publish_poll_interval)
+                == opennow_streamer_platform_linux::QueueReadiness::Closed
+            {
+                break;
+            }
+        } else {
+            thread::sleep(publish_poll_interval);
+        }
     }
     stop_linux_session(&shared);
 }
@@ -4393,6 +4419,15 @@ fn mark_macos_video_desynced(shared: &SharedPipeline, mid: &str, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedded_linux_ready_wake_requires_explicit_one() {
+        assert!(embedded_linux_ready_wake_enabled(Some("1")));
+        for value in [None, Some("0"), Some("2"), Some("true"), Some(" 1"), Some("")] {
+            assert!(!embedded_linux_ready_wake_enabled(value));
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

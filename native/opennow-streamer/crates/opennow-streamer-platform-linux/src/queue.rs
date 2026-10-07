@@ -17,6 +17,13 @@ pub enum QueuePop<T> {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueReadiness {
+    Ready,
+    TimedOut,
+    Closed,
+}
+
 #[derive(Debug)]
 struct State<T> {
     items: VecDeque<T>,
@@ -169,6 +176,30 @@ impl<T> BoundedQueue<T> {
         }
     }
 
+    pub fn wait_readable(&self, timeout: Duration) -> QueueReadiness {
+        let start = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            if state.closed {
+                return QueueReadiness::Closed;
+            }
+            if !state.items.is_empty() {
+                return QueueReadiness::Ready;
+            }
+            let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+                return QueueReadiness::TimedOut;
+            };
+            let (next, _) = self
+                .ready
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poison| poison.into_inner());
+            state = next;
+        }
+    }
+
     pub fn pop_timeout(&self, timeout: Duration) -> Option<T> {
         match self.wait_pop(timeout) {
             QueuePop::Item(item) => Some(item),
@@ -214,6 +245,84 @@ impl<T> BoundedQueue<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_keeps_latest_and_skipped_items_for_the_consumer() {
+        let queue = BoundedQueue::new(3);
+        for frame in 1..=3 {
+            queue.push_latest(frame);
+        }
+        assert_eq!(queue.wait_readable(Duration::ZERO), QueueReadiness::Ready);
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.try_pop_latest(), Some((3, 2)));
+        assert_eq!(queue.wait_readable(Duration::ZERO), QueueReadiness::TimedOut);
+    }
+
+    #[test]
+    fn readiness_wakes_on_push_and_close() {
+        use std::sync::{Arc, mpsc};
+        for close in [false, true] {
+            let queue = Arc::new(BoundedQueue::new(1));
+            let waiting = Arc::clone(&queue);
+            let (started, start) = mpsc::sync_channel(1);
+            let (finished, finish) = mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                finished
+                    .send(waiting.wait_readable(Duration::from_secs(5)))
+                    .unwrap();
+            });
+            start.recv().unwrap();
+            if close {
+                queue.close();
+            } else {
+                queue.push_latest(7);
+            }
+            assert_eq!(
+                finish.recv_timeout(Duration::from_secs(1)).unwrap(),
+                if close {
+                    QueueReadiness::Closed
+                } else {
+                    QueueReadiness::Ready
+                }
+            );
+            worker.join().unwrap();
+            assert_eq!(
+                queue.try_pop_latest(),
+                if close { None } else { Some((7, 0)) }
+            );
+        }
+    }
+
+    #[test]
+    fn spurious_readiness_wakes_do_not_restart_the_timeout() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let queue = Arc::new(BoundedQueue::<u8>::new(1));
+        let notified = Arc::clone(&queue);
+        let done = Arc::new(AtomicBool::new(false));
+        let notifier_done = Arc::clone(&done);
+        let worker = std::thread::spawn(move || {
+            let start = Instant::now();
+            while !notifier_done.load(Ordering::Acquire)
+                && start.elapsed() < Duration::from_millis(500)
+            {
+                notified.ready.notify_all();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let start = Instant::now();
+        assert_eq!(
+            queue.wait_readable(Duration::from_millis(25)),
+            QueueReadiness::TimedOut
+        );
+        let elapsed = start.elapsed();
+        done.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert!(elapsed >= Duration::from_millis(25));
+        assert!(elapsed < Duration::from_millis(250));
+        assert_eq!(queue.len(), 0);
+    }
 
     #[test]
     fn latest_pop_discards_stale_frames_and_counts_them() {
