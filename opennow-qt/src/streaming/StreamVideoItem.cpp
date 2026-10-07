@@ -457,6 +457,8 @@ void StreamVideoItem::setFsrUpscaling(bool enabled)
 
 void StreamVideoItem::connectFrameSwaps()
 {
+    static const bool continuousVideoUpdate =
+        qEnvironmentVariable("OPENNOW_CONTINUOUS_VIDEO_UPDATE") == QStringLiteral("1");
     disconnect(m_frameSwapConnection);
     disconnect(m_frameUpdateConnection);
     if (!window() || !m_renderCallback) return;
@@ -465,7 +467,12 @@ void StreamVideoItem::connectFrameSwaps()
         if (auto renderer = callback.lock()) renderer->frameSwapped();
     }, Qt::DirectConnection);
     m_frameUpdateConnection = connect(window(), &QQuickWindow::frameSwapped, this, [this] {
-        if (m_frameGeneration && isVisible() && m_renderCallback && m_renderCallback->needsFrame())
+        const bool ordinaryVideoUpdate = continuousVideoUpdate && !m_frameGeneration
+            && window() && window()->isVisible() && window()->visibility() != QWindow::Minimized
+            && isVisible() && m_renderCallback && m_renderCallback->hasVideoFrame()
+            && s_nativeRuntime && s_nativeRuntime->running() && s_nativeRuntime->presentationAllowed();
+        if (ordinaryVideoUpdate
+                || (m_frameGeneration && isVisible() && m_renderCallback && m_renderCallback->needsFrame()))
             update();
     }, Qt::QueuedConnection);
 }

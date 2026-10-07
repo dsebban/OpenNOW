@@ -263,6 +263,7 @@ public:
             reportFailure(QStringLiteral("Could not import the decoded video texture into Qt. The decoder and graphics backend must use compatible GPU resources."));
             return;
         }
+        m_hasVideoFrame.store(true);
         if (m_reportedColorFormat != recorded.texture_format
                 || m_reportedColorSpace != recorded.color_space
                 || m_reportedOutputBits != m_textures.outputBits()) {
@@ -371,6 +372,11 @@ public:
     bool needsFrame() const override
     {
         return m_needsFrame.load() && m_runtime && m_runtime->presentationAllowed();
+    }
+
+    bool hasVideoFrame() const override
+    {
+        return m_hasVideoFrame.load();
     }
 
     QVariantMap swapStats() const override
@@ -504,6 +510,7 @@ public:
         if (m_rhi && m_graphicsReady) m_rhi->finish();
         finishFrame();
         m_textures.release();
+        m_hasVideoFrame.store(false);
         m_interpolator.release();
         m_pacer.reset();
         m_swapTimings.reset();
@@ -577,6 +584,7 @@ private:
     bool m_outputDirty = false;
     int m_outputKind = 0;
     std::atomic_bool m_needsFrame = false;
+    std::atomic_bool m_hasVideoFrame = false;
     std::atomic_bool m_midpointSwapped = false;
     std::atomic_int m_submittedKind = 0;
     std::atomic<FrameGenerationState> m_frameGenerationStatus = FrameGenerationState::Off;
@@ -650,6 +658,7 @@ private:
     }
     void reportFailure(const QString &message)
     {
+        m_hasVideoFrame.store(false);
         if (m_reportedFailure || !m_runtime) return;
         m_reportedFailure = true;
         m_runtime->reportPresentationError(message, m_presentationGeneration);

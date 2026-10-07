@@ -24,6 +24,7 @@ public:
     virtual void setFsrUpscaling(bool) {}
     virtual void setUpscalingEnhancement(int, int) {}
     virtual bool needsFrame() const { return false; }
+    virtual bool hasVideoFrame() const { return false; }
     virtual void frameSwapped() {}
     virtual QVariantMap frameGenerationStats() const { return {}; }
     virtual QVariantMap swapStats() const { return {}; }
