@@ -145,6 +145,77 @@ class NativeStreamRuntimeTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void recordingCensusSeparatesEmptyAcquisitionFromRecordNoFrame()
+    {
+        static OpenNowStreamerStatus acquireStatus;
+        static OpenNowStreamerStatus recordStatus;
+        static int releases;
+        releases = 0;
+        auto api = fakeApi();
+        api.acquireLatestFrame = [](const OpenNowStreamer *handle, OpenNowStreamerFrame **frame,
+                                    OpenNowStreamerFrameInfo *info) {
+            if (acquireStatus != OPENNOW_STREAMER_OK) {
+                *frame = nullptr;
+                return acquireStatus;
+            }
+            return fakeAcquireLatestFrame(handle, frame, info);
+        };
+        api.recordFrame = [](const OpenNowStreamer *, const OpenNowStreamerFrame *,
+                             const OpenNowStreamerRecordCommand *, OpenNowStreamerRecordedFrame *output) {
+            *output = {1, 0, OPENNOW_STREAMER_GRAPHICS_API_D3D11,
+                       OPENNOW_STREAMER_TEXTURE_FORMAT_RGBA8, OPENNOW_STREAMER_COLOR_SPACE_SDR709,
+                       1920, 1080, 0, 1, 42};
+            return recordStatus;
+        };
+        api.releaseFrame = [](OpenNowStreamerFrame *frame) {
+            ++releases;
+            return fakeReleaseFrame(frame);
+        };
+        NativeStreamRuntime runtime(api);
+        QVERIFY(runtime.start());
+        OpenNowStreamerRecordCommand command{};
+        command.version = OPENNOW_STREAMER_RENDER_COMMAND_VERSION;
+        command.struct_size = sizeof(command);
+        const auto attempt = [&](OpenNowStreamerStatus acquisition, OpenNowStreamerStatus recording) {
+            acquireStatus = acquisition;
+            recordStatus = recording;
+            OpenNowStreamerFrameInfo info{};
+            OpenNowStreamerRecordedFrame output{};
+            OpenNowStreamerFrame *frame = nullptr;
+            const auto status = runtime.recordLatestFrame(command, &info, &output, &frame);
+            QCOMPARE(status, acquisition == OPENNOW_STREAMER_OK ? recording : acquisition);
+            if (status == OPENNOW_STREAMER_OK) {
+                QVERIFY(frame);
+                QCOMPARE(runtime.releaseFrame(frame), OPENNOW_STREAMER_OK);
+            } else {
+                QVERIFY(!frame);
+            }
+        };
+        for (const auto status : {OPENNOW_STREAMER_NO_FRAME, OPENNOW_STREAMER_STALE_FRAME,
+                                 OPENNOW_STREAMER_GRAPHICS_UNAVAILABLE})
+            attempt(status, OPENNOW_STREAMER_OK);
+        for (const auto status : {OPENNOW_STREAMER_NO_FRAME, OPENNOW_STREAMER_STALE_FRAME,
+                                 OPENNOW_STREAMER_GRAPHICS_UNAVAILABLE, OPENNOW_STREAMER_OK})
+            attempt(OPENNOW_STREAMER_OK, status);
+        auto stats = runtime.frameNotificationStats();
+        QCOMPARE(stats.value(QStringLiteral("runtimeAcquireCallsTotal")).toULongLong(), qulonglong(7));
+        QCOMPARE(stats.value(QStringLiteral("runtimeAcquireSuccessTotal")).toULongLong(), qulonglong(4));
+        for (const auto *key : {"runtimeAcquireEmptyTotal", "runtimeAcquireStaleTotal", "runtimeAcquireErrorTotal",
+                                "runtimeRecordSuccessTotal", "runtimeRecordNoFrameTotal", "runtimeRecordStaleTotal",
+                                "runtimeRecordErrorTotal"})
+            QCOMPARE(stats.value(QString::fromLatin1(key)).toULongLong(), qulonglong(1));
+        QCOMPARE(stats.value(QStringLiteral("runtimeRecordCallsTotal")).toULongLong(), qulonglong(4));
+        QCOMPARE(releases, 4);
+        const auto generation = runtime.presentationGeneration();
+        QCOMPARE(stats.value(QStringLiteral("runtimeRecordStageGeneration")).toULongLong(), generation);
+        QVERIFY(runtime.send({{QStringLiteral("type"), QStringLiteral("stop")}}));
+        stats = runtime.frameNotificationStats();
+        QCOMPARE(stats.value(QStringLiteral("runtimeRecordStageGeneration")).toULongLong(), generation + 1);
+        QCOMPARE(stats.value(QStringLiteral("runtimeAcquireCallsTotal")).toULongLong(), qulonglong(0));
+        QCOMPARE(stats.value(QStringLiteral("runtimeRecordNoFrameTotal")).toULongLong(), qulonglong(0));
+        QVERIFY(runtime.shutdown());
+    }
+
     void rumbleCallbacksValidateFieldsAndRejectReplacedSessions()
     {
         static OpenNowStreamerConfig callbackConfig;

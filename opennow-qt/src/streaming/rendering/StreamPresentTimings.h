@@ -52,6 +52,11 @@ public:
         std::uint64_t windowIntervalSamplesTotal = 0;
         std::uint64_t windowIntervalOverflowTotal = 0;
         std::int64_t windowIntervalMaxNs = 0;
+        std::uint64_t renderPrepareTotal = 0;
+        std::uint64_t renderTextureImportsTotal = 0;
+        std::uint64_t renderCallTotal = 0;
+        std::uint64_t renderDrawsIssuedTotal = 0;
+        std::uint64_t renderFreshSubmitsTotal = 0;
     };
 
     void markSubmit(std::int64_t nowNs, std::uint64_t mediaPtsNs = 0)
@@ -103,6 +108,26 @@ public:
         m_hasLastSwap = true;
     }
 
+    void markRenderPrepare()
+    {
+        const std::lock_guard lock(m_mutex);
+        ++m_renderPrepareTotal;
+    }
+
+    void markTextureImport()
+    {
+        const std::lock_guard lock(m_mutex);
+        ++m_renderTextureImportsTotal;
+    }
+
+    void markRenderCall(bool drawIssued, bool freshSubmit)
+    {
+        const std::lock_guard lock(m_mutex);
+        ++m_renderCallTotal;
+        if (drawIssued) ++m_renderDrawsIssuedTotal;
+        if (freshSubmit) ++m_renderFreshSubmitsTotal;
+    }
+
     void markWindowSwap(std::int64_t nowNs, bool freshSourceSubmit)
     {
         const std::lock_guard lock(m_mutex);
@@ -150,6 +175,11 @@ public:
         result.windowIntervalSamplesTotal = m_windowIntervalSamplesTotal;
         result.windowIntervalOverflowTotal = m_windowIntervalOverflowTotal;
         result.windowIntervalMaxNs = m_windowIntervalMaxNs;
+        result.renderPrepareTotal = m_renderPrepareTotal;
+        result.renderTextureImportsTotal = m_renderTextureImportsTotal;
+        result.renderCallTotal = m_renderCallTotal;
+        result.renderDrawsIssuedTotal = m_renderDrawsIssuedTotal;
+        result.renderFreshSubmitsTotal = m_renderFreshSubmitsTotal;
         if (m_windowSamples == 0) return result;
         std::vector<std::int64_t> sorted(m_samples.begin(), m_samples.begin() + m_windowSamples);
         std::sort(sorted.begin(), sorted.end());
@@ -205,6 +235,11 @@ public:
         m_windowIntervalOverflowTotal = 0;
         m_windowIntervalMaxNs = 0;
         m_hasWindowIntervalAnchor = false;
+        m_renderPrepareTotal = 0;
+        m_renderTextureImportsTotal = 0;
+        m_renderCallTotal = 0;
+        m_renderDrawsIssuedTotal = 0;
+        m_renderFreshSubmitsTotal = 0;
         ++m_epoch;
     }
 
@@ -262,4 +297,9 @@ private:
     std::int64_t m_windowIntervalMaxNs = 0;
     std::int64_t m_windowIntervalAnchorNs = 0;
     bool m_hasWindowIntervalAnchor = false;
+    std::uint64_t m_renderPrepareTotal = 0;
+    std::uint64_t m_renderTextureImportsTotal = 0;
+    std::uint64_t m_renderCallTotal = 0;
+    std::uint64_t m_renderDrawsIssuedTotal = 0;
+    std::uint64_t m_renderFreshSubmitsTotal = 0;
 };

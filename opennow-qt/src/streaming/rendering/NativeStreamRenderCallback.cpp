@@ -152,6 +152,7 @@ public:
 
     void prepareNativeFrame(QRhiCommandBuffer *commandBuffer)
     {
+        m_swapTimings.markRenderPrepare();
         if (!m_runtime || !m_runtime->presentationAllowed()
                 || m_presentationGeneration != m_runtime->presentationGeneration()) return;
         if (!m_graphicsReady || !m_rhi || !commandBuffer) return;
@@ -264,6 +265,7 @@ public:
             return;
         }
         m_hasVideoFrame.store(true);
+        m_swapTimings.markTextureImport();
         if (m_reportedColorFormat != recorded.texture_format
                 || m_reportedColorSpace != recorded.color_space
                 || m_reportedOutputBits != m_textures.outputBits()) {
@@ -410,6 +412,11 @@ public:
         stats.insert(QStringLiteral("windowIntervalSamplesTotal"), qulonglong(snapshot.windowIntervalSamplesTotal));
         stats.insert(QStringLiteral("windowIntervalOverflowTotal"), qulonglong(snapshot.windowIntervalOverflowTotal));
         stats.insert(QStringLiteral("windowIntervalMaxMs"), double(snapshot.windowIntervalMaxNs) / 1.0e6);
+        stats.insert(QStringLiteral("renderPrepareTotal"), qulonglong(snapshot.renderPrepareTotal));
+        stats.insert(QStringLiteral("renderTextureImportsTotal"), qulonglong(snapshot.renderTextureImportsTotal));
+        stats.insert(QStringLiteral("renderCallTotal"), qulonglong(snapshot.renderCallTotal));
+        stats.insert(QStringLiteral("renderDrawsIssuedTotal"), qulonglong(snapshot.renderDrawsIssuedTotal));
+        stats.insert(QStringLiteral("renderFreshSubmitsTotal"), qulonglong(snapshot.renderFreshSubmitsTotal));
         const auto histogram = [](const StreamPresentTimings::Histogram &values) {
             QVariantList result;
             result.reserve(StreamPresentTimings::HistogramCapacity);
@@ -491,7 +498,8 @@ public:
     {
         if (!m_runtime || !m_runtime->presentationAllowed()
                 || m_presentationGeneration != m_runtime->presentationGeneration()) return;
-        m_textures.render(commandBuffer, m_stencil, m_stencilReference);
+        const bool drawIssued = m_textures.render(commandBuffer, m_stencil, m_stencilReference);
+        m_swapTimings.markRenderCall(drawIssued, m_outputDirty && m_outputKind == 1);
         if (m_outputDirty) {
             m_submittedKind.store(m_outputKind);
             m_outputDirty = false;

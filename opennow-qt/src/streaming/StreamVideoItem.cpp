@@ -336,7 +336,13 @@ void StreamVideoItem::writeLiveTelemetry()
              "notificationTimingEpoch", "notificationEnqueuedTotal", "notificationCoalescedTotal",
              "notificationDeliveredTotal", "notificationDrainSamplesTotal",
              "notificationOldestOverflowTotal", "notificationLatestOverflowTotal",
-             "notificationOldestMaxMs", "notificationLatestMaxMs"}) {
+             "notificationOldestMaxMs", "notificationLatestMaxMs",
+             "runtimeRecordStageGeneration", "runtimeAcquireCallsTotal", "runtimeAcquireSuccessTotal",
+             "runtimeAcquireEmptyTotal", "runtimeAcquireStaleTotal", "runtimeAcquireErrorTotal",
+             "runtimeRecordCallsTotal", "runtimeRecordSuccessTotal", "runtimeRecordNoFrameTotal",
+             "runtimeRecordStaleTotal", "runtimeRecordErrorTotal",
+             "renderPrepareTotal", "renderTextureImportsTotal", "renderCallTotal",
+             "renderDrawsIssuedTotal", "renderFreshSubmitsTotal"}) {
         const auto name = QString::fromLatin1(key);
         number(name, name);
     }

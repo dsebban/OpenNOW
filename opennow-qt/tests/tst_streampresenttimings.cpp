@@ -23,6 +23,32 @@ class StreamPresentTimingsTest : public QObject
 {
     Q_OBJECT
 private slots:
+    void renderCensusCountsDrawsSeparatelyFromFreshMarkRequests()
+    {
+        StreamPresentTimings timings;
+        timings.setGated(true);
+        timings.markRenderPrepare();
+        timings.markTextureImport();
+        timings.markRenderCall(false, true);
+        timings.setGated(false);
+        timings.markRenderCall(true, false);
+        auto snapshot = timings.snapshot();
+        QCOMPARE(snapshot.renderPrepareTotal, std::uint64_t(1));
+        QCOMPARE(snapshot.renderTextureImportsTotal, std::uint64_t(1));
+        QCOMPARE(snapshot.renderCallTotal, std::uint64_t(2));
+        QCOMPARE(snapshot.renderDrawsIssuedTotal, std::uint64_t(1));
+        QCOMPARE(snapshot.renderFreshSubmitsTotal, std::uint64_t(1));
+        QCOMPARE(snapshot.sourceSwapsTotal, std::uint64_t(0));
+        timings.reset();
+        snapshot = timings.snapshot();
+        QCOMPARE(snapshot.renderPrepareTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.renderTextureImportsTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.renderCallTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.renderDrawsIssuedTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.renderFreshSubmitsTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.epoch, std::uint64_t(1));
+    }
+
     void allWindowSwapsDistinguishFreshSourcesFromOtherSwaps()
     {
         StreamPresentTimings timings;

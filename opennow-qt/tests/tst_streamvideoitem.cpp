@@ -278,6 +278,12 @@ class StreamVideoItemTest final : public QObject
     };
 
 private slots:
+    void videoRendererReportsNoDrawWithoutAnImportedTexture()
+    {
+        StreamVideoTextureRenderer renderer;
+        QVERIFY(!renderer.render(nullptr, false, 0));
+    }
+
     void continuousVideoUpdatesRespectPresentationGates()
     {
         if (QGuiApplication::platformName() == QStringLiteral("offscreen"))
@@ -351,6 +357,11 @@ private slots:
             {QStringLiteral("windowSwapsTotal"), qulonglong(75)},
             {QStringLiteral("windowSwapsWithoutFreshSourceTotal"), qulonglong(15)},
             {QStringLiteral("windowIntervalHistogramMs"), histogram},
+            {QStringLiteral("renderPrepareTotal"), qulonglong(80)},
+            {QStringLiteral("renderTextureImportsTotal"), qulonglong(60)},
+            {QStringLiteral("renderCallTotal"), qulonglong(75)},
+            {QStringLiteral("renderDrawsIssuedTotal"), qulonglong(70)},
+            {QStringLiteral("renderFreshSubmitsTotal"), qulonglong(60)},
             {QStringLiteral("sourceIntervalHistogramMs"), histogram},
             {QStringLiteral("relativeMediaLagMs"), 4.5},
             {QStringLiteral("sinceLastSwapMs"), 2.0},
@@ -375,6 +386,8 @@ private slots:
         QCOMPARE(object.value(QStringLiteral("windowSwapsTotal")).toInt(), 75);
         QCOMPARE(object.value(QStringLiteral("windowSwapsWithoutFreshSourceTotal")).toInt(), 15);
         QCOMPARE(object.value(QStringLiteral("windowIntervalHistogramMs")).toArray().size(), 512);
+        QCOMPARE(object.value(QStringLiteral("renderDrawsIssuedTotal")).toInt(), 70);
+        QCOMPARE(object.value(QStringLiteral("renderFreshSubmitsTotal")).toInt(), 60);
         QCOMPARE(object.value(QStringLiteral("observerId")).toDouble(), double(item.m_liveTelemetryObserverId));
         QCOMPARE(object.value(QStringLiteral("sourceIntervalHistogramMs")).toArray().size(), 512);
         QCOMPARE(object.value(QStringLiteral("sourceIntervalHistogramMs")).toArray()[16].toInt(), 59);

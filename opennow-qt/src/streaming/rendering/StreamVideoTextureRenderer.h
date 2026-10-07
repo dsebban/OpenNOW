@@ -200,17 +200,18 @@ public:
         m_fsrOutputId = output->globalResourceId();
     }
 
-    void render(QRhiCommandBuffer *cb, bool stencil, int reference)
+    bool render(QRhiCommandBuffer *cb, bool stencil, int reference)
     {
         auto *pipeline = m_pipelines[stencil ? 1 : 0].get();
         auto *bindings = m_fsrBinding ? m_fsrBinding.get()
                          : m_externalSlot >= 0 ? m_external[m_externalSlot].bindings.get()
                                            : m_imports[m_currentSlot].bindings.get();
-        if (!pipeline || !bindings) return;
+        if (!pipeline || !bindings) return false;
         cb->setGraphicsPipeline(pipeline);
         cb->setShaderResources(bindings);
         if (stencil) cb->setStencilRef(reference);
         cb->draw(6);
+        return true;
     }
 
     void release()

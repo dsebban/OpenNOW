@@ -12,6 +12,7 @@
 #include <QMetaObject>
 #include <QPointer>
 #include <QQueue>
+#include <QScopeGuard>
 #include <QStandardPaths>
 
 #include <algorithm>
@@ -190,6 +191,19 @@ struct NativeStreamRuntime::CallbackState final
 };
 
 struct NativeStreamRuntime::Private {
+    struct RecordStageStats {
+        quint64 generation = 0;
+        quint64 acquireCalls = 0;
+        quint64 acquireSuccess = 0;
+        quint64 acquireEmpty = 0;
+        quint64 acquireStale = 0;
+        quint64 acquireError = 0;
+        quint64 recordCalls = 0;
+        quint64 recordSuccess = 0;
+        quint64 recordNoFrame = 0;
+        quint64 recordStale = 0;
+        quint64 recordError = 0;
+    };
     explicit Private(Api runtimeApi)
         : api(runtimeApi)
     {
@@ -206,6 +220,8 @@ struct NativeStreamRuntime::Private {
     OpenNowStreamer *handle = nullptr;
     std::shared_ptr<CallbackState> callbackState;
     quint64 notificationTimingEpoch = 0;
+    std::mutex recordStatsMutex;
+    RecordStageStats recordStats;
     QString lastError;
     bool graphicsActive = false;
     bool firstNotification = false;
@@ -323,6 +339,22 @@ QVariantMap NativeStreamRuntime::frameNotificationStats() const
         {QStringLiteral("notificationTimingEpoch"), qulonglong(epoch)},
         {QStringLiteral("notificationStatsAvailable"), bool(callbacks)},
     };
+    Private::RecordStageStats record;
+    {
+        const std::lock_guard lock(d->recordStatsMutex);
+        record = d->recordStats;
+    }
+    result.insert(QStringLiteral("runtimeRecordStageGeneration"), qulonglong(record.generation));
+    result.insert(QStringLiteral("runtimeAcquireCallsTotal"), qulonglong(record.acquireCalls));
+    result.insert(QStringLiteral("runtimeAcquireSuccessTotal"), qulonglong(record.acquireSuccess));
+    result.insert(QStringLiteral("runtimeAcquireEmptyTotal"), qulonglong(record.acquireEmpty));
+    result.insert(QStringLiteral("runtimeAcquireStaleTotal"), qulonglong(record.acquireStale));
+    result.insert(QStringLiteral("runtimeAcquireErrorTotal"), qulonglong(record.acquireError));
+    result.insert(QStringLiteral("runtimeRecordCallsTotal"), qulonglong(record.recordCalls));
+    result.insert(QStringLiteral("runtimeRecordSuccessTotal"), qulonglong(record.recordSuccess));
+    result.insert(QStringLiteral("runtimeRecordNoFrameTotal"), qulonglong(record.recordNoFrame));
+    result.insert(QStringLiteral("runtimeRecordStaleTotal"), qulonglong(record.recordStale));
+    result.insert(QStringLiteral("runtimeRecordErrorTotal"), qulonglong(record.recordError));
     if (!callbacks) return result;
     CallbackState::NotificationStats stats;
     {
@@ -356,7 +388,12 @@ bool NativeStreamRuntime::inputAllowed() const
 void NativeStreamRuntime::invalidatePresentation()
 {
     d->presentationAllowed.store(false, std::memory_order_release);
-    d->presentationGeneration.fetch_add(1, std::memory_order_acq_rel);
+    const auto generation = d->presentationGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    {
+        const std::lock_guard lock(d->recordStatsMutex);
+        d->recordStats = {};
+        d->recordStats.generation = generation;
+    }
     d->presentationStartId.clear();
     d->acceptedSessionStartId.clear();
     d->rumbleStartId.clear();
@@ -608,6 +645,23 @@ OpenNowStreamerStatus NativeStreamRuntime::recordLatestFrame(
     *info = {};
     *recorded = {};
     *frame = nullptr;
+    Private::RecordStageStats attempt;
+    attempt.generation = presentationGeneration();
+    const auto saveAttempt = qScopeGuard([this, &attempt] {
+        if (attempt.acquireCalls == 0) return;
+        const std::lock_guard lock(d->recordStatsMutex);
+        if (attempt.generation != d->recordStats.generation) return;
+        d->recordStats.acquireCalls += attempt.acquireCalls;
+        d->recordStats.acquireSuccess += attempt.acquireSuccess;
+        d->recordStats.acquireEmpty += attempt.acquireEmpty;
+        d->recordStats.acquireStale += attempt.acquireStale;
+        d->recordStats.acquireError += attempt.acquireError;
+        d->recordStats.recordCalls += attempt.recordCalls;
+        d->recordStats.recordSuccess += attempt.recordSuccess;
+        d->recordStats.recordNoFrame += attempt.recordNoFrame;
+        d->recordStats.recordStale += attempt.recordStale;
+        d->recordStats.recordError += attempt.recordError;
+    });
     const std::shared_lock lock(d->handleMutex);
     if (!d->handle || !d->api.acquireLatestFrame || !d->api.recordFrame
         || !d->api.releaseFrame) {
@@ -615,9 +669,24 @@ OpenNowStreamerStatus NativeStreamRuntime::recordLatestFrame(
     }
 
     auto status = d->api.acquireLatestFrame(d->handle, frame, info);
-    if (status != OPENNOW_STREAMER_OK) return status;
-    if (!*frame) return OPENNOW_STREAMER_NULL_POINTER;
+    ++attempt.acquireCalls;
+    if (status != OPENNOW_STREAMER_OK) {
+        if (status == OPENNOW_STREAMER_NO_FRAME) ++attempt.acquireEmpty;
+        else if (status == OPENNOW_STREAMER_STALE_FRAME) ++attempt.acquireStale;
+        else ++attempt.acquireError;
+        return status;
+    }
+    if (!*frame) {
+        ++attempt.acquireError;
+        return OPENNOW_STREAMER_NULL_POINTER;
+    }
+    ++attempt.acquireSuccess;
     status = d->api.recordFrame(d->handle, *frame, &command, recorded);
+    ++attempt.recordCalls;
+    if (status == OPENNOW_STREAMER_OK) ++attempt.recordSuccess;
+    else if (status == OPENNOW_STREAMER_NO_FRAME) ++attempt.recordNoFrame;
+    else if (status == OPENNOW_STREAMER_STALE_FRAME) ++attempt.recordStale;
+    else ++attempt.recordError;
     if (status != OPENNOW_STREAMER_OK) {
         d->api.releaseFrame(std::exchange(*frame, nullptr));
     } else {
