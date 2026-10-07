@@ -1450,17 +1450,14 @@ fn emit(events: &EventQueue, event: BackendEvent) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn frame_readiness_outlives_removed_session_and_does_not_lock_its_owner() {
+    fn readiness_session() -> super::LinuxSession {
         use super::*;
         let format = StreamFormat::video_default(2, 2).unwrap();
-        let decoded = Arc::new(BoundedQueue::new(3));
-        let weak = Arc::downgrade(&decoded);
-        let session = LinuxSession {
+        LinuxSession {
             config: SessionConfig::new(format),
             state: Arc::new(Mutex::new(LifecycleState::Running)),
             video_commands: Arc::new(BoundedQueue::new(1)),
-            decoded_frames: decoded,
+            decoded_frames: Arc::new(BoundedQueue::new(3)),
             audio_packets: None,
             audio_unavailable: Arc::new(AtomicBool::new(false)),
             events: Arc::new(BoundedQueue::new(64)),
@@ -1471,17 +1468,33 @@ mod tests {
             decode_timings: DecodeTimingProbe::default(),
             video_worker: None,
             audio_worker: None,
-        };
+        }
+    }
+
+    fn readiness_frame(timestamp_us: u64) -> super::DecodedVideoFrame {
+        super::DecodedVideoFrame {
+            format: super::StreamFormat::video_default(2, 2).unwrap(),
+            timestamp_us,
+            planes: Vec::new(),
+            dmabuf: None,
+            vulkan: None,
+        }
+    }
+
+    #[test]
+    fn frame_readiness_outlives_removed_session_and_does_not_lock_its_owner() {
+        use super::*;
+        let session = readiness_session();
+        let decoded = Arc::clone(&session.decoded_frames);
+        let weak = Arc::downgrade(&decoded);
         let owner = Mutex::new(Some(session));
         let readiness = owner.lock().unwrap().as_ref().unwrap().frame_readiness();
         let waiting = readiness.clone();
-        let (started, start) = mpsc::sync_channel(1);
         let (finished, finish) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
-            started.send(()).unwrap();
             finished.send(waiting.wait(Duration::from_secs(5))).unwrap();
         });
-        start.recv().unwrap();
+        decoded.wait_until_readiness_parked();
         let mut removed = owner.try_lock().unwrap().take().unwrap();
         removed.stop().unwrap();
         drop(removed);
@@ -1490,10 +1503,82 @@ mod tests {
             QueueReadiness::Closed
         );
         worker.join().unwrap();
+        drop(decoded);
         assert!(weak.upgrade().is_some());
         assert_eq!(readiness.wait(Duration::ZERO), QueueReadiness::Closed);
         drop(readiness);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn readiness_allows_pause_and_resume_while_the_publisher_is_parked() {
+        use super::*;
+        let session = readiness_session();
+        let decoded = Arc::clone(&session.decoded_frames);
+        let owner = Arc::new(Mutex::new(session));
+        let readiness = owner.lock().unwrap().frame_readiness();
+        let consuming = Arc::clone(&owner);
+        let (published, publication) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            assert_eq!(readiness.wait(Duration::from_secs(5)), QueueReadiness::Ready);
+            let session = consuming.lock().unwrap();
+            assert!(!session.paused.load(Ordering::Acquire));
+            let (frame, skipped) = session.try_recv_latest_frame().unwrap();
+            published.send((frame.timestamp_us, skipped)).unwrap();
+        });
+        decoded.wait_until_readiness_parked();
+        {
+            let session = owner.try_lock().unwrap();
+            session.set_paused(true).unwrap();
+            assert!(session.paused.load(Ordering::Acquire));
+            assert!(session.try_recv_latest_frame().is_none());
+            decoded.push_latest(readiness_frame(11));
+            session.set_paused(false).unwrap();
+            assert!(!session.paused.load(Ordering::Acquire));
+            decoded.push_latest(readiness_frame(42));
+        }
+        assert_eq!(
+            publication.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (42, 0)
+        );
+        worker.join().unwrap();
+        owner.lock().unwrap().stop().unwrap();
+    }
+
+    #[test]
+    fn burst_between_publisher_drain_and_wait_keeps_newest_and_exact_skips() {
+        use super::*;
+        let owner = Arc::new(Mutex::new(readiness_session()));
+        let readiness = owner.lock().unwrap().frame_readiness();
+        let consuming = Arc::clone(&owner);
+        let (drained, drain) = mpsc::sync_channel(1);
+        let (continue_wait, wait) = mpsc::sync_channel(1);
+        let (published, publication) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            assert!(consuming.lock().unwrap().try_recv_latest_frame().is_none());
+            drained.send(()).unwrap();
+            wait.recv().unwrap();
+            assert_eq!(readiness.wait(Duration::from_secs(5)), QueueReadiness::Ready);
+            let (frame, skipped) = consuming.lock().unwrap().try_recv_latest_frame().unwrap();
+            published.send((frame.timestamp_us, skipped)).unwrap();
+        });
+        drain.recv_timeout(Duration::from_secs(1)).unwrap();
+        {
+            let session = owner.lock().unwrap();
+            for timestamp in [10, 20, 30] {
+                assert_eq!(
+                    session.decoded_frames.push_latest(readiness_frame(timestamp)),
+                    QueuePush::Added
+                );
+            }
+        }
+        continue_wait.send(()).unwrap();
+        assert_eq!(
+            publication.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (30, 2)
+        );
+        worker.join().unwrap();
+        owner.lock().unwrap().stop().unwrap();
     }
 
     struct DelayedDecoder {

@@ -35,6 +35,8 @@ pub struct BoundedQueue<T> {
     capacity: usize,
     state: Mutex<State<T>>,
     ready: Condvar,
+    #[cfg(test)]
+    readiness_waiters: std::sync::atomic::AtomicUsize,
 }
 
 impl<T> BoundedQueue<T> {
@@ -47,6 +49,8 @@ impl<T> BoundedQueue<T> {
                 closed: false,
             }),
             ready: Condvar::new(),
+            #[cfg(test)]
+            readiness_waiters: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -192,11 +196,17 @@ impl<T> BoundedQueue<T> {
             let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
                 return QueueReadiness::TimedOut;
             };
+            #[cfg(test)]
+            self.readiness_waiters
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             let (next, _) = self
                 .ready
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(|poison| poison.into_inner());
             state = next;
+            #[cfg(test)]
+            self.readiness_waiters
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -233,6 +243,18 @@ impl<T> BoundedQueue<T> {
     }
 
     #[cfg(test)]
+    pub(crate) fn wait_until_readiness_parked(&self) {
+        use std::sync::atomic::Ordering;
+        let start = Instant::now();
+        while self.readiness_waiters.load(Ordering::Acquire) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(1));
+            std::thread::yield_now();
+        }
+        let _state = self.state.lock().unwrap();
+        assert!(self.readiness_waiters.load(Ordering::Acquire) > 0);
+    }
+
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.state
             .lock()
@@ -264,15 +286,13 @@ mod tests {
         for close in [false, true] {
             let queue = Arc::new(BoundedQueue::new(1));
             let waiting = Arc::clone(&queue);
-            let (started, start) = mpsc::sync_channel(1);
             let (finished, finish) = mpsc::sync_channel(1);
             let worker = std::thread::spawn(move || {
-                started.send(()).unwrap();
                 finished
                     .send(waiting.wait_readable(Duration::from_secs(5)))
                     .unwrap();
             });
-            start.recv().unwrap();
+            queue.wait_until_readiness_parked();
             if close {
                 queue.close();
             } else {
