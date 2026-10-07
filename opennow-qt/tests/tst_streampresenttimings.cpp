@@ -23,6 +23,53 @@ class StreamPresentTimingsTest : public QObject
 {
     Q_OBJECT
 private slots:
+    void allWindowSwapsDistinguishFreshSourcesFromOtherSwaps()
+    {
+        StreamPresentTimings timings;
+        for (std::int64_t frame = 0; frame < 60; ++frame) {
+            const auto now = 1'000'000'000 + frame * 16'666'667;
+            const bool fresh = frame % 6 != 5;
+            if (fresh) {
+                timings.markSubmit(now - 1'000'000);
+                timings.markSwap(now);
+            }
+            timings.markWindowSwap(now, fresh);
+        }
+        const auto snapshot = timings.snapshot();
+        QCOMPARE(snapshot.windowSwapsTotal, std::uint64_t(60));
+        QCOMPARE(snapshot.windowSwapsWithoutFreshSourceTotal, std::uint64_t(10));
+        QCOMPARE(snapshot.sourceSwapsTotal, std::uint64_t(50));
+        QCOMPARE(snapshot.windowIntervalSamplesTotal, std::uint64_t(59));
+        QCOMPARE(snapshot.windowIntervalHistogramMs[16], std::uint64_t(59));
+        QCOMPARE(snapshot.sourceIntervalSamplesTotal, std::uint64_t(49));
+        QCOMPARE(snapshot.sourceIntervalHistogramMs[33], std::uint64_t(9));
+    }
+
+    void windowSwapGatesReanchorIntervalsAndResetClearsCounters()
+    {
+        StreamPresentTimings timings;
+        timings.markWindowSwap(1'000'000'000, true);
+        timings.setGated(true);
+        timings.markWindowSwap(2'000'000'000, false);
+        timings.setGated(false);
+        timings.markWindowSwap(3'000'000'000, false);
+        auto snapshot = timings.snapshot();
+        QCOMPARE(snapshot.windowSwapsTotal, std::uint64_t(2));
+        QCOMPARE(snapshot.windowSwapsWithoutFreshSourceTotal, std::uint64_t(1));
+        QCOMPARE(snapshot.windowIntervalSamplesTotal, std::uint64_t(0));
+        timings.markWindowSwap(3'512'000'000, false);
+        snapshot = timings.snapshot();
+        QCOMPARE(snapshot.windowIntervalSamplesTotal, std::uint64_t(1));
+        QCOMPARE(snapshot.windowIntervalOverflowTotal, std::uint64_t(1));
+        QCOMPARE(snapshot.windowIntervalMaxNs, std::int64_t(512'000'000));
+        timings.reset();
+        snapshot = timings.snapshot();
+        QCOMPARE(snapshot.windowSwapsTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.windowIntervalSamplesTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.windowIntervalOverflowTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.epoch, std::uint64_t(1));
+    }
+
     void cumulativeHistogramsKeepAllSamplesBeyondTheRollingWindow()
     {
         StreamPresentTimings timings;

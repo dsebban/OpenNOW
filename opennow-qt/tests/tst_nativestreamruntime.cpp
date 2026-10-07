@@ -685,6 +685,50 @@ private slots:
         QVERIFY(runtime.shutdown());
     }
 
+    void frameNotificationCensusCountsCoalescingAndResetsWithTheRuntime()
+    {
+        NativeStreamRuntime runtime(fakeApi());
+        QSignalSpy frames(&runtime, &NativeStreamRuntime::frameAvailable);
+        QVERIFY(runtime.start());
+        const auto epoch = runtime.frameNotificationStats()
+            .value(QStringLiteral("notificationTimingEpoch")).toULongLong();
+        for (int index = 0; index < 3; ++index)
+            QVERIFY(runtime.send({{QStringLiteral("type"), QStringLiteral("ping")},
+                                  {QStringLiteral("id"), QString::number(index)}}));
+        auto stats = runtime.frameNotificationStats();
+        QCOMPARE(stats.value(QStringLiteral("notificationEnqueuedTotal")).toULongLong(), qulonglong(3));
+        QCOMPARE(stats.value(QStringLiteral("notificationCoalescedTotal")).toULongLong(), qulonglong(2));
+        QCOMPARE(stats.value(QStringLiteral("notificationDeliveredTotal")).toULongLong(), qulonglong(0));
+        QTRY_COMPARE_WITH_TIMEOUT(frames.size(), 1, 1'000);
+        stats = runtime.frameNotificationStats();
+        QCOMPARE(stats.value(QStringLiteral("notificationDeliveredTotal")).toULongLong(), qulonglong(1));
+        QCOMPARE(stats.value(QStringLiteral("notificationDrainSamplesTotal")).toULongLong(), qulonglong(1));
+        QVERIFY(stats.value(QStringLiteral("notificationOldestMaxMs")).toDouble()
+            >= stats.value(QStringLiteral("notificationLatestMaxMs")).toDouble());
+        for (const auto *stage : {"Oldest", "Latest"}) {
+            const auto histogram = stats.value(QStringLiteral("notification%1HistogramMs")
+                .arg(QString::fromLatin1(stage))).toList();
+            QCOMPARE(histogram.size(), 512);
+            qulonglong samples = stats.value(QStringLiteral("notification%1OverflowTotal")
+                .arg(QString::fromLatin1(stage))).toULongLong();
+            for (const auto &value : histogram) samples += value.toULongLong();
+            QCOMPARE(samples, qulonglong(1));
+        }
+        QVERIFY(runtime.send({{QStringLiteral("type"), QStringLiteral("ping")},
+                              {QStringLiteral("id"), QStringLiteral("late-old-notification")}}));
+        QVERIFY(runtime.shutdown());
+        QVERIFY(!runtime.frameNotificationStats().value(QStringLiteral("notificationStatsAvailable")).toBool());
+        QVERIFY(runtime.start());
+        frames.clear();
+        QCoreApplication::processEvents();
+        QVERIFY(frames.isEmpty());
+        stats = runtime.frameNotificationStats();
+        QCOMPARE(stats.value(QStringLiteral("notificationTimingEpoch")).toULongLong(), epoch + 2);
+        QCOMPARE(stats.value(QStringLiteral("notificationEnqueuedTotal")).toULongLong(), qulonglong(0));
+        QCOMPARE(stats.value(QStringLiteral("notificationDrainSamplesTotal")).toULongLong(), qulonglong(0));
+        QVERIFY(runtime.shutdown());
+    }
+
     void discardsPresentationErrorsFromAnEarlierSession()
     {
         NativeStreamRuntime runtime(fakeApi());

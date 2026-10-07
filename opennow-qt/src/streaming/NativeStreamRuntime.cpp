@@ -162,6 +162,18 @@ struct NativeStreamRuntime::CallbackState final
         bool cursor = false;
         quint64 rumbleEpoch = 0;
     };
+    struct NotificationStats {
+        std::array<quint64, 512> oldestHistogramMs{};
+        std::array<quint64, 512> latestHistogramMs{};
+        quint64 enqueuedTotal = 0;
+        quint64 coalescedTotal = 0;
+        quint64 deliveredTotal = 0;
+        quint64 drainSamplesTotal = 0;
+        quint64 oldestOverflowTotal = 0;
+        quint64 latestOverflowTotal = 0;
+        std::int64_t oldestMaxNs = 0;
+        std::int64_t latestMaxNs = 0;
+    };
 
     std::mutex mutex;
     QQueue<Message> pending;
@@ -171,6 +183,9 @@ struct NativeStreamRuntime::CallbackState final
     bool accepting = true;
     bool drainScheduled = false;
     bool framePending = false;
+    std::int64_t firstFramePendingNs = 0;
+    std::int64_t latestFramePendingNs = 0;
+    NotificationStats notificationStats;
     quint64 rumbleEpoch = 0;
 };
 
@@ -190,6 +205,7 @@ struct NativeStreamRuntime::Private {
     std::shared_mutex handleMutex;
     OpenNowStreamer *handle = nullptr;
     std::shared_ptr<CallbackState> callbackState;
+    quint64 notificationTimingEpoch = 0;
     QString lastError;
     bool graphicsActive = false;
     bool firstNotification = false;
@@ -294,6 +310,44 @@ bool NativeStreamRuntime::presentationAllowed() const
     return d->presentationAllowed.load(std::memory_order_acquire);
 }
 
+QVariantMap NativeStreamRuntime::frameNotificationStats() const
+{
+    std::shared_ptr<CallbackState> callbacks;
+    quint64 epoch = 0;
+    {
+        const std::shared_lock lock(d->handleMutex);
+        callbacks = d->callbackState;
+        epoch = d->notificationTimingEpoch;
+    }
+    QVariantMap result{
+        {QStringLiteral("notificationTimingEpoch"), qulonglong(epoch)},
+        {QStringLiteral("notificationStatsAvailable"), bool(callbacks)},
+    };
+    if (!callbacks) return result;
+    CallbackState::NotificationStats stats;
+    {
+        const std::lock_guard lock(callbacks->mutex);
+        stats = callbacks->notificationStats;
+    }
+    result.insert(QStringLiteral("notificationEnqueuedTotal"), qulonglong(stats.enqueuedTotal));
+    result.insert(QStringLiteral("notificationCoalescedTotal"), qulonglong(stats.coalescedTotal));
+    result.insert(QStringLiteral("notificationDeliveredTotal"), qulonglong(stats.deliveredTotal));
+    result.insert(QStringLiteral("notificationDrainSamplesTotal"), qulonglong(stats.drainSamplesTotal));
+    result.insert(QStringLiteral("notificationOldestOverflowTotal"), qulonglong(stats.oldestOverflowTotal));
+    result.insert(QStringLiteral("notificationLatestOverflowTotal"), qulonglong(stats.latestOverflowTotal));
+    result.insert(QStringLiteral("notificationOldestMaxMs"), double(stats.oldestMaxNs) / 1.0e6);
+    result.insert(QStringLiteral("notificationLatestMaxMs"), double(stats.latestMaxNs) / 1.0e6);
+    const auto histogram = [](const auto &values) {
+        QVariantList result;
+        result.reserve(512);
+        for (const auto value : values) result.append(qulonglong(value));
+        return result;
+    };
+    result.insert(QStringLiteral("notificationOldestHistogramMs"), histogram(stats.oldestHistogramMs));
+    result.insert(QStringLiteral("notificationLatestHistogramMs"), histogram(stats.latestHistogramMs));
+    return result;
+}
+
 bool NativeStreamRuntime::inputAllowed() const
 {
     return d->inputAllowed.load(std::memory_order_acquire);
@@ -387,6 +441,7 @@ bool NativeStreamRuntime::start()
     {
         const std::lock_guard lock(d->handleMutex);
         d->callbackState = std::move(callbacks);
+        ++d->notificationTimingEpoch;
         d->handle = handle;
     }
     setLastError({});
@@ -471,6 +526,7 @@ bool NativeStreamRuntime::shutdown(int timeoutMs)
         if (!graphicsActive) {
             handle = std::exchange(d->handle, nullptr);
             callbacks = std::exchange(d->callbackState, {});
+            if (callbacks) ++d->notificationTimingEpoch;
         }
     }
     if (graphicsActive) {
@@ -488,6 +544,8 @@ bool NativeStreamRuntime::shutdown(int timeoutMs)
         callbacks->pending.clear();
         callbacks->dropped = 0;
         callbacks->framePending = false;
+        callbacks->firstFramePendingNs = 0;
+        callbacks->latestFramePendingNs = 0;
     }
 
     struct Completion {
@@ -798,6 +856,12 @@ void NativeStreamRuntime::enqueueFrameAvailable(CallbackState *state)
     {
         const std::lock_guard lock(state->mutex);
         if (!state->accepting) return;
+        const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        ++state->notificationStats.enqueuedTotal;
+        if (state->framePending) ++state->notificationStats.coalescedTotal;
+        else state->firstFramePendingNs = now;
+        state->latestFramePendingNs = now;
         state->framePending = true;
         if (!state->drainScheduled) {
             state->drainScheduled = true;
@@ -847,6 +911,23 @@ void NativeStreamRuntime::drainCallbacks(const std::shared_ptr<CallbackState> &s
         dropped = std::exchange(state->dropped, 0);
         rumbleEpoch = state->rumbleEpoch;
         framePending = std::exchange(state->framePending, false);
+        if (framePending) {
+            const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            auto &stats = state->notificationStats;
+            const auto oldestNs = std::max<std::int64_t>(0, now - state->firstFramePendingNs);
+            const auto latestNs = std::max<std::int64_t>(0, now - state->latestFramePendingNs);
+            ++stats.drainSamplesTotal;
+            const auto record = [](auto &histogram, auto &overflow, std::int64_t durationNs) {
+                const auto bucket = std::uint64_t(durationNs / 1'000'000);
+                if (bucket < histogram.size()) ++histogram[bucket];
+                else ++overflow;
+            };
+            record(stats.oldestHistogramMs, stats.oldestOverflowTotal, oldestNs);
+            record(stats.latestHistogramMs, stats.latestOverflowTotal, latestNs);
+            stats.oldestMaxNs = std::max(stats.oldestMaxNs, oldestNs);
+            stats.latestMaxNs = std::max(stats.latestMaxNs, latestNs);
+        }
         reschedule = !state->pending.isEmpty() || state->framePending;
         if (!reschedule) state->drainScheduled = false;
     }
@@ -864,6 +945,10 @@ void NativeStreamRuntime::drainCallbacks(const std::shared_ptr<CallbackState> &s
         if (!d->firstNotification) {
             handshakeLog(u"first frame notification delivered to Qt GUI (not yet presentation)"_s);
             d->firstNotification = true;
+        }
+        {
+            const std::lock_guard lock(state->mutex);
+            ++state->notificationStats.deliveredTotal;
         }
         emit frameAvailable();
         if (!current()) return;

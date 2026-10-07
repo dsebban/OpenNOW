@@ -405,6 +405,11 @@ public:
         stats.insert(QStringLiteral("submitOverflowTotal"), qulonglong(snapshot.submitOverflowTotal));
         stats.insert(QStringLiteral("submitMaxMs"), double(snapshot.submitMaxNs) / 1.0e6);
         stats.insert(QStringLiteral("ptsDiscontinuitiesTotal"), qulonglong(snapshot.ptsDiscontinuitiesTotal));
+        stats.insert(QStringLiteral("windowSwapsTotal"), qulonglong(snapshot.windowSwapsTotal));
+        stats.insert(QStringLiteral("windowSwapsWithoutFreshSourceTotal"), qulonglong(snapshot.windowSwapsWithoutFreshSourceTotal));
+        stats.insert(QStringLiteral("windowIntervalSamplesTotal"), qulonglong(snapshot.windowIntervalSamplesTotal));
+        stats.insert(QStringLiteral("windowIntervalOverflowTotal"), qulonglong(snapshot.windowIntervalOverflowTotal));
+        stats.insert(QStringLiteral("windowIntervalMaxMs"), double(snapshot.windowIntervalMaxNs) / 1.0e6);
         const auto histogram = [](const StreamPresentTimings::Histogram &values) {
             QVariantList result;
             result.reserve(StreamPresentTimings::HistogramCapacity);
@@ -413,6 +418,7 @@ public:
         };
         stats.insert(QStringLiteral("sourceIntervalHistogramMs"), histogram(snapshot.sourceIntervalHistogramMs));
         stats.insert(QStringLiteral("submitHistogramMs"), histogram(snapshot.submitHistogramMs));
+        stats.insert(QStringLiteral("windowIntervalHistogramMs"), histogram(snapshot.windowIntervalHistogramMs));
         if (snapshot.hasRelativeMediaLag)
             stats.insert(QStringLiteral("relativeMediaLagMs"), snapshot.relativeMediaLagMs);
         if (snapshot.hasLastSwap)
@@ -435,6 +441,7 @@ public:
         }
         if (kind == 2) m_midpointSwapped.store(true);
         const auto now = clockNs();
+        m_swapTimings.markWindowSwap(now, kind == 1);
         const auto start = m_sampleStart.load();
         if (!start) {
             m_sampleStart.store(now);

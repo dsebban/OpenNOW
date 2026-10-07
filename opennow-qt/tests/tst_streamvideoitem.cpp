@@ -348,6 +348,9 @@ private slots:
             {QStringLiteral("sourceSwapsTotal"), qulonglong(60)},
             {QStringLiteral("lateSourceIntervalsTotal"), qulonglong(1)},
             {QStringLiteral("ptsDiscontinuitiesTotal"), qulonglong(2)},
+            {QStringLiteral("windowSwapsTotal"), qulonglong(75)},
+            {QStringLiteral("windowSwapsWithoutFreshSourceTotal"), qulonglong(15)},
+            {QStringLiteral("windowIntervalHistogramMs"), histogram},
             {QStringLiteral("sourceIntervalHistogramMs"), histogram},
             {QStringLiteral("relativeMediaLagMs"), 4.5},
             {QStringLiteral("sinceLastSwapMs"), 2.0},
@@ -369,6 +372,9 @@ private slots:
         QCOMPARE(object.value(QStringLiteral("sourceCountersEpoch")).toInt(), 2);
         QCOMPARE(object.value(QStringLiteral("lateSourceIntervalsTotal")).toInt(), 1);
         QCOMPARE(object.value(QStringLiteral("ptsDiscontinuitiesTotal")).toInt(), 2);
+        QCOMPARE(object.value(QStringLiteral("windowSwapsTotal")).toInt(), 75);
+        QCOMPARE(object.value(QStringLiteral("windowSwapsWithoutFreshSourceTotal")).toInt(), 15);
+        QCOMPARE(object.value(QStringLiteral("windowIntervalHistogramMs")).toArray().size(), 512);
         QCOMPARE(object.value(QStringLiteral("observerId")).toDouble(), double(item.m_liveTelemetryObserverId));
         QCOMPARE(object.value(QStringLiteral("sourceIntervalHistogramMs")).toArray().size(), 512);
         QCOMPARE(object.value(QStringLiteral("sourceIntervalHistogramMs")).toArray()[16].toInt(), 59);

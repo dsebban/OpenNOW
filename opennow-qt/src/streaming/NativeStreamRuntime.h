@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QString>
+#include <QVariantMap>
 
 #include <cstddef>
 #include <cstdint>
@@ -107,6 +108,7 @@ public:
         quint64 decodedOutputsTotal = 0;
     };
     [[nodiscard]] UpstreamProgress upstreamProgress() const;
+    [[nodiscard]] QVariantMap frameNotificationStats() const;
     [[nodiscard]] bool inputAllowed() const;
     [[nodiscard]] bool serverCursorComposited() const;
     [[nodiscard]] const OpenNowStreamerVulkanDevice *vulkanDevice() const;

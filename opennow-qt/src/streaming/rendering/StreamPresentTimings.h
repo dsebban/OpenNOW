@@ -46,6 +46,12 @@ public:
         bool hasRelativeMediaLag = false;
         double relativeMediaLagMs = 0;
         std::uint64_t ptsDiscontinuitiesTotal = 0;
+        Histogram windowIntervalHistogramMs{};
+        std::uint64_t windowSwapsTotal = 0;
+        std::uint64_t windowSwapsWithoutFreshSourceTotal = 0;
+        std::uint64_t windowIntervalSamplesTotal = 0;
+        std::uint64_t windowIntervalOverflowTotal = 0;
+        std::int64_t windowIntervalMaxNs = 0;
     };
 
     void markSubmit(std::int64_t nowNs, std::uint64_t mediaPtsNs = 0)
@@ -97,6 +103,22 @@ public:
         m_hasLastSwap = true;
     }
 
+    void markWindowSwap(std::int64_t nowNs, bool freshSourceSubmit)
+    {
+        const std::lock_guard lock(m_mutex);
+        if (m_gated) return;
+        ++m_windowSwapsTotal;
+        if (!freshSourceSubmit) ++m_windowSwapsWithoutFreshSourceTotal;
+        if (m_hasWindowIntervalAnchor && nowNs > m_windowIntervalAnchorNs) {
+            const auto interval = nowNs - m_windowIntervalAnchorNs;
+            addHistogram(m_windowIntervalHistogramMs, m_windowIntervalOverflowTotal, interval);
+            ++m_windowIntervalSamplesTotal;
+            m_windowIntervalMaxNs = std::max(m_windowIntervalMaxNs, interval);
+        }
+        m_windowIntervalAnchorNs = nowNs;
+        m_hasWindowIntervalAnchor = true;
+    }
+
     Snapshot snapshot() const
     {
         const std::lock_guard lock(m_mutex);
@@ -122,6 +144,12 @@ public:
         result.hasRelativeMediaLag = m_hasMediaAnchor;
         result.relativeMediaLagMs = m_relativeMediaLagMs;
         result.ptsDiscontinuitiesTotal = m_ptsDiscontinuitiesTotal;
+        result.windowIntervalHistogramMs = m_windowIntervalHistogramMs;
+        result.windowSwapsTotal = m_windowSwapsTotal;
+        result.windowSwapsWithoutFreshSourceTotal = m_windowSwapsWithoutFreshSourceTotal;
+        result.windowIntervalSamplesTotal = m_windowIntervalSamplesTotal;
+        result.windowIntervalOverflowTotal = m_windowIntervalOverflowTotal;
+        result.windowIntervalMaxNs = m_windowIntervalMaxNs;
         if (m_windowSamples == 0) return result;
         std::vector<std::int64_t> sorted(m_samples.begin(), m_samples.begin() + m_windowSamples);
         std::sort(sorted.begin(), sorted.end());
@@ -140,6 +168,7 @@ public:
         if (gated) {
             m_hasPendingSubmit = false;
             m_hasIntervalAnchor = false;
+            m_hasWindowIntervalAnchor = false;
             m_hasMediaAnchor = false;
         }
     }
@@ -169,6 +198,13 @@ public:
         m_hasIntervalAnchor = false;
         m_hasMediaAnchor = false;
         m_ptsDiscontinuitiesTotal = 0;
+        m_windowIntervalHistogramMs = {};
+        m_windowSwapsTotal = 0;
+        m_windowSwapsWithoutFreshSourceTotal = 0;
+        m_windowIntervalSamplesTotal = 0;
+        m_windowIntervalOverflowTotal = 0;
+        m_windowIntervalMaxNs = 0;
+        m_hasWindowIntervalAnchor = false;
         ++m_epoch;
     }
 
@@ -218,4 +254,12 @@ private:
     std::int64_t m_mediaAnchorSwapNs = 0;
     double m_relativeMediaLagMs = 0;
     std::uint64_t m_ptsDiscontinuitiesTotal = 0;
+    Histogram m_windowIntervalHistogramMs{};
+    std::uint64_t m_windowSwapsTotal = 0;
+    std::uint64_t m_windowSwapsWithoutFreshSourceTotal = 0;
+    std::uint64_t m_windowIntervalSamplesTotal = 0;
+    std::uint64_t m_windowIntervalOverflowTotal = 0;
+    std::int64_t m_windowIntervalMaxNs = 0;
+    std::int64_t m_windowIntervalAnchorNs = 0;
+    bool m_hasWindowIntervalAnchor = false;
 };

@@ -284,7 +284,8 @@ QVariantMap StreamVideoItem::swapStats() const
 void StreamVideoItem::writeLiveTelemetry()
 {
     if (m_liveTelemetryPath.isEmpty() || m_liveTelemetryFailed) return;
-    const auto stats = swapStats();
+    auto stats = swapStats();
+    if (s_nativeRuntime) stats.insert(s_nativeRuntime->frameNotificationStats());
     QJsonObject snapshot{
         {QStringLiteral("event"), QStringLiteral("qt-presentation")},
         {QStringLiteral("observerId"), double(m_liveTelemetryObserverId)},
@@ -304,6 +305,7 @@ void StreamVideoItem::writeLiveTelemetry()
         {QStringLiteral("videoHeight"), m_videoSize.height()},
         {QStringLiteral("gated"), stats.value(QStringLiteral("gated")).toBool()},
         {QStringLiteral("hasPendingSubmit"), stats.value(QStringLiteral("hasPendingSubmit")).toBool()},
+        {QStringLiteral("notificationStatsAvailable"), stats.value(QStringLiteral("notificationStatsAvailable")).toBool()},
         {QStringLiteral("lateThresholdMs"), 25},
         {QStringLiteral("sinceLastSourceSwapMs"), QJsonValue::Null},
         {QStringLiteral("relativeMediaLagMs"), QJsonValue::Null},
@@ -328,13 +330,21 @@ void StreamVideoItem::writeLiveTelemetry()
              "epoch", "sourceCountersEpoch", "gateEpoch", "swappedFramesTotal", "sourceSwapsTotal",
              "sourceIntervalSamplesTotal", "sourceIntervalOverflowTotal", "lateSourceIntervalsTotal",
              "sourceIntervalMaxMs", "submitSamplesTotal", "submitOverflowTotal", "submitMaxMs",
-             "relativeMediaLagMs", "ptsDiscontinuitiesTotal"}) {
+             "relativeMediaLagMs", "ptsDiscontinuitiesTotal",
+             "windowSwapsTotal", "windowSwapsWithoutFreshSourceTotal", "windowIntervalSamplesTotal",
+             "windowIntervalOverflowTotal", "windowIntervalMaxMs",
+             "notificationTimingEpoch", "notificationEnqueuedTotal", "notificationCoalescedTotal",
+             "notificationDeliveredTotal", "notificationDrainSamplesTotal",
+             "notificationOldestOverflowTotal", "notificationLatestOverflowTotal",
+             "notificationOldestMaxMs", "notificationLatestMaxMs"}) {
         const auto name = QString::fromLatin1(key);
         number(name, name);
     }
     if (stats.value(QStringLiteral("sourceSwapsTotal")).toULongLong() != 0)
         number(QStringLiteral("sinceLastSwapMs"), QStringLiteral("sinceLastSourceSwapMs"));
-    for (const auto *key : {"sourceIntervalHistogramMs", "submitHistogramMs"}) {
+    for (const auto *key : {"sourceIntervalHistogramMs", "submitHistogramMs",
+                            "windowIntervalHistogramMs", "notificationOldestHistogramMs",
+                            "notificationLatestHistogramMs"}) {
         const auto name = QString::fromLatin1(key);
         const auto values = stats.value(name).toList();
         if (values.size() != 512) continue;
