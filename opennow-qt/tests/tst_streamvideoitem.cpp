@@ -303,6 +303,7 @@ private slots:
             {QStringLiteral("submitMaxMs"), QStringLiteral("private-secret")},
         };
         item.setRenderCallback(callback);
+        item.setVisible(false);
         item.writeLiveTelemetry();
         QFile file(path);
         QVERIFY(file.open(QIODevice::ReadOnly));
