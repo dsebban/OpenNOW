@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::audio::{AudioSink, OpusDecoder, open_audio_fallback, open_audio_sink};
-use crate::queue::{BoundedQueue, QueuePop, QueuePush, QueueReadiness};
+use crate::queue::{BoundedQueue, QueuePop, QueuePush};
 use crate::timing::{DecodeTimingProbe, DecodeTimings};
 use crate::video::{VideoDecoder, open_v4l2};
 use crate::{
@@ -185,17 +185,6 @@ enum VideoCommand {
 }
 
 type EventQueue = Arc<BoundedQueue<BackendEvent>>;
-
-#[derive(Clone)]
-pub struct DecodedFrameReadiness {
-    queue: Arc<BoundedQueue<DecodedVideoFrame>>,
-}
-
-impl DecodedFrameReadiness {
-    pub fn wait(&self, timeout: Duration) -> QueueReadiness {
-        self.queue.wait_readable(timeout)
-    }
-}
 
 pub struct LinuxSession {
     config: SessionConfig,
@@ -425,12 +414,6 @@ impl LinuxSession {
 
     pub fn try_recv_latest_frame(&self) -> Option<(DecodedVideoFrame, usize)> {
         self.decoded_frames.try_pop_latest()
-    }
-
-    pub fn frame_readiness(&self) -> DecodedFrameReadiness {
-        DecodedFrameReadiness {
-            queue: Arc::clone(&self.decoded_frames),
-        }
     }
 
     pub fn recv_frame_timeout(&self, timeout: Duration) -> Option<DecodedVideoFrame> {
@@ -1450,52 +1433,6 @@ fn emit(events: &EventQueue, event: BackendEvent) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn frame_readiness_outlives_removed_session_and_does_not_lock_its_owner() {
-        use super::*;
-        let format = StreamFormat::video_default(2, 2).unwrap();
-        let decoded = Arc::new(BoundedQueue::new(3));
-        let weak = Arc::downgrade(&decoded);
-        let session = LinuxSession {
-            config: SessionConfig::new(format),
-            state: Arc::new(Mutex::new(LifecycleState::Running)),
-            video_commands: Arc::new(BoundedQueue::new(1)),
-            decoded_frames: decoded,
-            audio_packets: None,
-            audio_unavailable: Arc::new(AtomicBool::new(false)),
-            events: Arc::new(BoundedQueue::new(64)),
-            video_generation: AtomicU64::new(0),
-            video_needs_keyframe: AtomicBool::new(false),
-            paused: AtomicBool::new(false),
-            video_submit: Mutex::new(()),
-            decode_timings: DecodeTimingProbe::default(),
-            video_worker: None,
-            audio_worker: None,
-        };
-        let owner = Mutex::new(Some(session));
-        let readiness = owner.lock().unwrap().as_ref().unwrap().frame_readiness();
-        let waiting = readiness.clone();
-        let (started, start) = mpsc::sync_channel(1);
-        let (finished, finish) = mpsc::sync_channel(1);
-        let worker = thread::spawn(move || {
-            started.send(()).unwrap();
-            finished.send(waiting.wait(Duration::from_secs(5))).unwrap();
-        });
-        start.recv().unwrap();
-        let mut removed = owner.try_lock().unwrap().take().unwrap();
-        removed.stop().unwrap();
-        drop(removed);
-        assert_eq!(
-            finish.recv_timeout(Duration::from_secs(1)).unwrap(),
-            QueueReadiness::Closed
-        );
-        worker.join().unwrap();
-        assert!(weak.upgrade().is_some());
-        assert_eq!(readiness.wait(Duration::ZERO), QueueReadiness::Closed);
-        drop(readiness);
-        assert!(weak.upgrade().is_none());
-    }
-
     struct DelayedDecoder {
         frame: Option<super::DecodedVideoFrame>,
         reference_lost: bool,

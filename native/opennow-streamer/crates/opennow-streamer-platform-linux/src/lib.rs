@@ -60,11 +60,9 @@ pub use frame_producer::{
 #[cfg(all(target_os = "linux", feature = "vulkan"))]
 pub use presentation::{NativeSurface, VulkanPresenter};
 #[cfg(target_os = "linux")]
-pub use queue::QueueReadiness;
-#[cfg(target_os = "linux")]
 pub use session::{
-    BackendEvent, DecodedFrameReadiness, DecoderBackend, DecoderPreference, LifecycleState,
-    LinuxSession, PushOutcome, SessionConfig,
+    BackendEvent, DecoderBackend, DecoderPreference, LifecycleState, LinuxSession, PushOutcome,
+    SessionConfig,
 };
 #[cfg(target_os = "linux")]
 pub use timing::{DecodeStagePercentiles, DecodeTimingProbe, DecodeTimings};
