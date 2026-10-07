@@ -241,6 +241,7 @@ public:
             return;
         }
         m_preparedFrame = frame;
+        m_sourceMediaPtsNs = info.presentation_time_ns;
         if (m_sourceColorSpace != int(recorded.color_space)) {
             resetFrameGeneration();
             m_sourceColorSpace = int(recorded.color_space);
@@ -386,6 +387,28 @@ public:
         stats.insert(QStringLiteral("swappedFramesTotal"),
                      qulonglong(snapshot.swappedFramesTotal));
         stats.insert(QStringLiteral("epoch"), qulonglong(snapshot.epoch));
+        stats.insert(QStringLiteral("sourceCountersEpoch"), qulonglong(snapshot.epoch));
+        stats.insert(QStringLiteral("gateEpoch"), qulonglong(snapshot.gateEpoch));
+        stats.insert(QStringLiteral("hasPendingSubmit"), snapshot.hasPendingSubmit);
+        stats.insert(QStringLiteral("sourceSwapsTotal"), qulonglong(snapshot.sourceSwapsTotal));
+        stats.insert(QStringLiteral("sourceIntervalSamplesTotal"), qulonglong(snapshot.sourceIntervalSamplesTotal));
+        stats.insert(QStringLiteral("sourceIntervalOverflowTotal"), qulonglong(snapshot.sourceIntervalOverflowTotal));
+        stats.insert(QStringLiteral("lateSourceIntervalsTotal"), qulonglong(snapshot.lateSourceIntervalsTotal));
+        stats.insert(QStringLiteral("sourceIntervalMaxMs"), double(snapshot.sourceIntervalMaxNs) / 1.0e6);
+        stats.insert(QStringLiteral("submitSamplesTotal"), qulonglong(snapshot.submitSamplesTotal));
+        stats.insert(QStringLiteral("submitOverflowTotal"), qulonglong(snapshot.submitOverflowTotal));
+        stats.insert(QStringLiteral("submitMaxMs"), double(snapshot.submitMaxNs) / 1.0e6);
+        stats.insert(QStringLiteral("ptsDiscontinuitiesTotal"), qulonglong(snapshot.ptsDiscontinuitiesTotal));
+        const auto histogram = [](const StreamPresentTimings::Histogram &values) {
+            QVariantList result;
+            result.reserve(StreamPresentTimings::HistogramCapacity);
+            for (const auto value : values) result.append(qulonglong(value));
+            return result;
+        };
+        stats.insert(QStringLiteral("sourceIntervalHistogramMs"), histogram(snapshot.sourceIntervalHistogramMs));
+        stats.insert(QStringLiteral("submitHistogramMs"), histogram(snapshot.submitHistogramMs));
+        if (snapshot.hasRelativeMediaLag)
+            stats.insert(QStringLiteral("relativeMediaLagMs"), snapshot.relativeMediaLagMs);
         if (snapshot.hasLastSwap)
             stats.insert(QStringLiteral("sinceLastSwapMs"),
                          double(clockNs() - snapshot.lastSwapNs) / 1.0e6);
@@ -459,7 +482,7 @@ public:
         if (m_outputDirty) {
             m_submittedKind.store(m_outputKind);
             m_outputDirty = false;
-            if (m_outputKind == 1) m_swapTimings.markSubmit(clockNs());
+            if (m_outputKind == 1) m_swapTimings.markSubmit(clockNs(), m_sourceMediaPtsNs);
         }
         observeSwapProgress();
     }
@@ -538,6 +561,7 @@ private:
     StreamSwapStallWatchdog m_swapStall;
     bool m_resourceRearmPending = false;
     int m_sourceColorSpace = OPENNOW_STREAMER_COLOR_SPACE_SDR709;
+    std::uint64_t m_sourceMediaPtsNs = 0;
     StreamFrameInterpolator m_interpolator;
     StreamFramePacer m_pacer;
     QSize m_historySize;

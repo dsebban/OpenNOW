@@ -189,6 +189,7 @@ private:
     void syncSwapGate();
     [[nodiscard]] QString currentSwapGateSource() const;
     void pushSwapGate();
+    void writeLiveTelemetry();
     [[nodiscard]] static QRect cursorConfinementRect(const QRect &viewport, bool rawRelative);
     void releaseCursorConfinement();
     void submitAbsoluteMouse(const QPointF &position);
@@ -220,6 +221,9 @@ private:
     int m_upscalingDenoise = 0;
     QTimer m_frameStatsTimer;
     QTimer m_swapStatsTimer;
+    QString m_liveTelemetryPath;
+    quint64 m_liveTelemetryObserverId = 0;
+    bool m_liveTelemetryFailed = false;
     QString m_swapGateSource;
     QMetaObject::Connection m_frameSwapConnection;
     QMetaObject::Connection m_frameUpdateConnection;

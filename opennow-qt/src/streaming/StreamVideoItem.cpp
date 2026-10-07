@@ -4,18 +4,31 @@
 #include "input/platform/MacPointerCapture.h"
 #include "streaming/NativeStreamRuntime.h"
 #include "streaming/rendering/NativeStreamRenderCallback.h"
+#include "streaming/rendering/StreamSwapStallWatchdog.h"
 
 #include <QCursor>
+#include <QDateTime>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMetaObject>
 #include <QQmlEngine>
 #include <QQuickWindow>
+#include <QScreen>
 #include <QThread>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <utility>
 
 QPointer<NativeStreamRuntime> StreamVideoItem::s_nativeRuntime;
+
+namespace {
+std::atomic<quint64> nextLiveTelemetryObserverId{0};
+}
 
 StreamVideoItem::StreamVideoItem(QQuickItem *parent)
     : StreamVideoItem(std::make_unique<MacPointerCapture>(), MacPointerCapture::isSupported(), parent)
@@ -55,6 +68,10 @@ StreamVideoItem::StreamVideoItem(std::unique_ptr<MacPointerCapture> pointerCaptu
             this, &StreamVideoItem::frameGenerationStatsChanged);
     m_swapStatsTimer.setInterval(1000);
     connect(&m_swapStatsTimer, &QTimer::timeout, this, &StreamVideoItem::swapStatsChanged);
+    m_liveTelemetryPath = qEnvironmentVariable("OPENNOW_LIVE_TELEMETRY");
+    m_liveTelemetryObserverId = nextLiveTelemetryObserverId.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!m_liveTelemetryPath.isEmpty())
+        connect(&m_swapStatsTimer, &QTimer::timeout, this, &StreamVideoItem::writeLiveTelemetry);
     connect(this, &QQuickItem::visibleChanged, this, &StreamVideoItem::updateSwapGate,
             Qt::UniqueConnection);
     if (s_nativeRuntime) {
@@ -262,6 +279,89 @@ QVariantMap StreamVideoItem::swapStats() const
     if (!m_swapGateSource.isEmpty())
         stats.insert(QStringLiteral("gateSource"), m_swapGateSource);
     return stats;
+}
+
+void StreamVideoItem::writeLiveTelemetry()
+{
+    if (m_liveTelemetryPath.isEmpty() || m_liveTelemetryFailed) return;
+    const auto stats = swapStats();
+    QJsonObject snapshot{
+        {QStringLiteral("event"), QStringLiteral("qt-presentation")},
+        {QStringLiteral("observerId"), double(m_liveTelemetryObserverId)},
+        {QStringLiteral("wallTimeMs"), double(QDateTime::currentMSecsSinceEpoch())},
+        {QStringLiteral("monotonicNs"), double(streamMonotonicClockNs())},
+        {QStringLiteral("visible"), isVisible()},
+        {QStringLiteral("windowActive"), window() && window()->isActive()},
+        {QStringLiteral("fullscreen"), window() && window()->visibility() == QWindow::FullScreen},
+        {QStringLiteral("displayHz"), window() && window()->screen() ? window()->screen()->refreshRate() : 0},
+        {QStringLiteral("frameGeneration"), m_frameGeneration},
+        {QStringLiteral("inputEnabled"), m_inputEnabled},
+        {QStringLiteral("captureActive"), m_captureActive},
+        {QStringLiteral("runtimeRunning"), s_nativeRuntime && s_nativeRuntime->running()},
+        {QStringLiteral("presentationAllowed"), s_nativeRuntime && s_nativeRuntime->presentationAllowed()},
+        {QStringLiteral("presentationGeneration"), s_nativeRuntime ? double(s_nativeRuntime->presentationGeneration()) : 0},
+        {QStringLiteral("videoWidth"), m_videoSize.width()},
+        {QStringLiteral("videoHeight"), m_videoSize.height()},
+        {QStringLiteral("gated"), stats.value(QStringLiteral("gated")).toBool()},
+        {QStringLiteral("hasPendingSubmit"), stats.value(QStringLiteral("hasPendingSubmit")).toBool()},
+        {QStringLiteral("lateThresholdMs"), 25},
+        {QStringLiteral("sinceLastSourceSwapMs"), QJsonValue::Null},
+        {QStringLiteral("relativeMediaLagMs"), QJsonValue::Null},
+    };
+    const auto number = [&stats, &snapshot](const QString &source, const QString &target) {
+        const auto value = stats.value(source);
+        switch (value.metaType().id()) {
+        case QMetaType::Int:
+        case QMetaType::UInt:
+        case QMetaType::LongLong:
+        case QMetaType::ULongLong:
+        case QMetaType::Double:
+        case QMetaType::Float: {
+            const double numeric = value.toDouble();
+            if (std::isfinite(numeric)) snapshot.insert(target, numeric);
+            break;
+        }
+        default: break;
+        }
+    };
+    for (const auto *key : {
+             "epoch", "sourceCountersEpoch", "gateEpoch", "swappedFramesTotal", "sourceSwapsTotal",
+             "sourceIntervalSamplesTotal", "sourceIntervalOverflowTotal", "lateSourceIntervalsTotal",
+             "sourceIntervalMaxMs", "submitSamplesTotal", "submitOverflowTotal", "submitMaxMs",
+             "relativeMediaLagMs", "ptsDiscontinuitiesTotal"}) {
+        const auto name = QString::fromLatin1(key);
+        number(name, name);
+    }
+    if (stats.value(QStringLiteral("sourceSwapsTotal")).toULongLong() != 0)
+        number(QStringLiteral("sinceLastSwapMs"), QStringLiteral("sinceLastSourceSwapMs"));
+    for (const auto *key : {"sourceIntervalHistogramMs", "submitHistogramMs"}) {
+        const auto name = QString::fromLatin1(key);
+        const auto values = stats.value(name).toList();
+        if (values.size() != 512) continue;
+        QJsonArray histogram;
+        bool valid = true;
+        for (const auto &value : values) {
+            if (value.metaType().id() != QMetaType::ULongLong) {
+                valid = false;
+                break;
+            }
+            histogram.append(double(value.toULongLong()));
+        }
+        if (valid) snapshot.insert(name, histogram);
+    }
+    QFile file(m_liveTelemetryPath);
+    if (QFileInfo(m_liveTelemetryPath).isSymLink()
+        || !file.open(QIODevice::WriteOnly | QIODevice::Append)
+        || !file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner)) {
+        m_liveTelemetryFailed = true;
+        qWarning("Live presentation telemetry unavailable");
+        return;
+    }
+    const auto line = QJsonDocument(snapshot).toJson(QJsonDocument::Compact) + '\n';
+    if (file.write(line) != line.size() || !file.flush()) {
+        m_liveTelemetryFailed = true;
+        qWarning("Live presentation telemetry write failed");
+    }
 }
 
 QString StreamVideoItem::currentSwapGateSource() const

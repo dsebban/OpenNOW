@@ -11,6 +11,10 @@
 #include <QKeySequence>
 #include <QBuffer>
 #include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QFile>
+#include <QTemporaryDir>
 #include <QKeyEvent>
 #include <QCursor>
 #include <QPixmap>
@@ -40,6 +44,8 @@
 class TestRenderCallback final : public StreamVideoRenderCallback
 {
 public:
+    QVariantMap swapStats() const override { return telemetryStats; }
+    QVariantMap telemetryStats;
     void initialize(QRhi *rhi,
                     QRhiCommandBuffer *commandBuffer,
                     QRhiRenderTarget *renderTarget) override
@@ -270,6 +276,58 @@ class StreamVideoItemTest final : public QObject
     };
 
 private slots:
+    void liveTelemetryIsOptInAndWritesOnlyNumericAllowlistedFields()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        StreamVideoItem item;
+        item.m_liveTelemetryPath.clear();
+        item.writeLiveTelemetry();
+        const auto path = directory.filePath(QStringLiteral("presentation.jsonl"));
+        QVERIFY(!QFile::exists(path));
+        item.m_liveTelemetryPath = path;
+        StreamVideoItem secondItem;
+        QVERIFY(secondItem.m_liveTelemetryObserverId > item.m_liveTelemetryObserverId);
+        auto callback = std::make_shared<TestRenderCallback>();
+        QVariantList histogram;
+        for (int bin = 0; bin < 512; ++bin) histogram.append(qulonglong(bin == 16 ? 59 : 0));
+        callback->telemetryStats = {
+            {QStringLiteral("sourceCountersEpoch"), qulonglong(2)},
+            {QStringLiteral("sourceSwapsTotal"), qulonglong(60)},
+            {QStringLiteral("lateSourceIntervalsTotal"), qulonglong(1)},
+            {QStringLiteral("ptsDiscontinuitiesTotal"), qulonglong(2)},
+            {QStringLiteral("sourceIntervalHistogramMs"), histogram},
+            {QStringLiteral("relativeMediaLagMs"), 4.5},
+            {QStringLiteral("sinceLastSwapMs"), 2.0},
+            {QStringLiteral("token"), QStringLiteral("private-secret")},
+            {QStringLiteral("submitMaxMs"), QStringLiteral("private-secret")},
+        };
+        item.setRenderCallback(callback);
+        item.writeLiveTelemetry();
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const auto bytes = file.readAll();
+        QVERIFY(!bytes.contains("private-secret"));
+        QJsonParseError error;
+        const auto object = QJsonDocument::fromJson(bytes, &error).object();
+        QCOMPARE(error.error, QJsonParseError::NoError);
+        QCOMPARE(object.value(QStringLiteral("event")).toString(), QStringLiteral("qt-presentation"));
+        QCOMPARE(object.value(QStringLiteral("sourceSwapsTotal")).toInt(), 60);
+        QCOMPARE(object.value(QStringLiteral("sourceCountersEpoch")).toInt(), 2);
+        QCOMPARE(object.value(QStringLiteral("lateSourceIntervalsTotal")).toInt(), 1);
+        QCOMPARE(object.value(QStringLiteral("ptsDiscontinuitiesTotal")).toInt(), 2);
+        QCOMPARE(object.value(QStringLiteral("observerId")).toDouble(), double(item.m_liveTelemetryObserverId));
+        QCOMPARE(object.value(QStringLiteral("sourceIntervalHistogramMs")).toArray().size(), 512);
+        QCOMPARE(object.value(QStringLiteral("sourceIntervalHistogramMs")).toArray()[16].toInt(), 59);
+        QCOMPARE(object.value(QStringLiteral("relativeMediaLagMs")).toDouble(), 4.5);
+        QCOMPARE(object.value(QStringLiteral("sinceLastSourceSwapMs")).toDouble(), 2.0);
+        QCOMPARE(object.value(QStringLiteral("frameGeneration")).toBool(), false);
+        QVERIFY(object.value(QStringLiteral("gated")).toBool());
+        QVERIFY(!object.contains(QStringLiteral("token")));
+        QVERIFY(!object.contains(QStringLiteral("submitMaxMs")));
+        QVERIFY(!(file.permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther)));
+    }
+
     void clipboardPasteRouting_data()
     {
         QTest::addColumn<bool>("fullscreen");

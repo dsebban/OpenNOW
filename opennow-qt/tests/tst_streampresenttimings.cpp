@@ -23,6 +23,95 @@ class StreamPresentTimingsTest : public QObject
 {
     Q_OBJECT
 private slots:
+    void cumulativeHistogramsKeepAllSamplesBeyondTheRollingWindow()
+    {
+        StreamPresentTimings timings;
+        for (std::int64_t frame = 0; frame < 300; ++frame) {
+            const auto swap = 1'000'000'000 + frame * 16'666'667;
+            timings.markSubmit(swap - 2'500'000);
+            timings.markSwap(swap);
+        }
+        const auto snapshot = timings.snapshot();
+        QCOMPARE(snapshot.windowSamples, StreamPresentTimings::WindowCapacity);
+        QCOMPARE(snapshot.sourceSwapsTotal, std::uint64_t(300));
+        QCOMPARE(snapshot.submitSamplesTotal, std::uint64_t(300));
+        QCOMPARE(snapshot.submitHistogramMs[2], std::uint64_t(300));
+        QCOMPARE(snapshot.sourceIntervalSamplesTotal, std::uint64_t(299));
+        QCOMPARE(snapshot.sourceIntervalHistogramMs[16], std::uint64_t(299));
+        QCOMPARE(snapshot.lateSourceIntervalsTotal, std::uint64_t(0));
+    }
+
+    void lateSourceThresholdIsExactDespiteMillisecondBuckets()
+    {
+        StreamPresentTimings timings;
+        const auto present = [&timings](std::int64_t now) {
+            timings.markSubmit(now - 1);
+            timings.markSwap(now);
+        };
+        present(1'000'000'000);
+        present(1'025'000'000);
+        present(1'050'000'001);
+        present(1'562'000'001);
+        const auto snapshot = timings.snapshot();
+        QCOMPARE(snapshot.sourceIntervalSamplesTotal, std::uint64_t(3));
+        QCOMPARE(snapshot.sourceIntervalHistogramMs[25], std::uint64_t(2));
+        QCOMPARE(snapshot.sourceIntervalOverflowTotal, std::uint64_t(1));
+        QCOMPARE(snapshot.sourceIntervalMaxNs, std::int64_t(512'000'000));
+        QCOMPARE(snapshot.lateSourceIntervalsTotal, std::uint64_t(2));
+    }
+
+    void repeatsAndGatedTimeDoNotBecomeSourceIntervals()
+    {
+        StreamPresentTimings timings;
+        timings.markSubmit(1'000'000'000, 100'000'000);
+        timings.markSwap(1'001'000'000);
+        timings.markSwap(1'017'000'000);
+        QCOMPARE(timings.snapshot().sourceSwapsTotal, std::uint64_t(1));
+        timings.setGated(true);
+        timings.markSubmit(2'000'000'000);
+        timings.markSwap(2'001'000'000);
+        timings.setGated(false);
+        timings.markSubmit(3'000'000'000, 120'000'000);
+        timings.markSwap(3'001'000'000);
+        auto snapshot = timings.snapshot();
+        QCOMPARE(snapshot.gateEpoch, std::uint64_t(1));
+        QCOMPARE(snapshot.sourceSwapsTotal, std::uint64_t(2));
+        QCOMPARE(snapshot.sourceIntervalSamplesTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.relativeMediaLagMs, 0.0);
+        timings.reset();
+        snapshot = timings.snapshot();
+        QCOMPARE(snapshot.epoch, std::uint64_t(1));
+        QCOMPARE(snapshot.sourceSwapsTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.submitSamplesTotal, std::uint64_t(0));
+        QCOMPARE(snapshot.submitHistogramMs[1], std::uint64_t(0));
+        QVERIFY(!snapshot.hasRelativeMediaLag);
+    }
+
+    void mediaLagComparesElapsedClocksAndReanchorsOnPtsRegression()
+    {
+        StreamPresentTimings timings;
+        timings.markSubmit(1'000'000'000, 10'000'000'000);
+        timings.markSwap(1'001'000'000);
+        timings.markSubmit(1'020'000'000, 10'016'000'000);
+        timings.markSwap(1'021'000'000);
+        auto snapshot = timings.snapshot();
+        QVERIFY(snapshot.hasRelativeMediaLag);
+        QCOMPARE(snapshot.relativeMediaLagMs, 4.0);
+        QCOMPARE(snapshot.ptsDiscontinuitiesTotal, std::uint64_t(0));
+        timings.markSubmit(1'040'000'000, 10'000'000'000);
+        timings.markSwap(1'041'000'000);
+        QCOMPARE(timings.snapshot().relativeMediaLagMs, 0.0);
+        QCOMPARE(timings.snapshot().ptsDiscontinuitiesTotal, std::uint64_t(1));
+        timings.markSubmit(1'050'000'000, 10'000'000'000);
+        timings.markSwap(1'051'000'000);
+        QCOMPARE(timings.snapshot().ptsDiscontinuitiesTotal, std::uint64_t(2));
+        timings.markSubmit(1'060'000'000);
+        timings.markSwap(1'061'000'000);
+        QVERIFY(!timings.snapshot().hasRelativeMediaLag);
+        timings.reset();
+        QCOMPARE(timings.snapshot().ptsDiscontinuitiesTotal, std::uint64_t(0));
+    }
+
     void reportsNothingBeforeAFrameIsPresented()
     {
         StreamPresentTimings timings;
