@@ -46,6 +46,8 @@ class TestRenderCallback final : public StreamVideoRenderCallback
 public:
     QVariantMap swapStats() const override { return telemetryStats; }
     QVariantMap telemetryStats;
+    bool hasVideoFrame() const override { return videoReady.load(); }
+    std::atomic_bool videoReady = false;
     void initialize(QRhi *rhi,
                     QRhiCommandBuffer *commandBuffer,
                     QRhiRenderTarget *renderTarget) override
@@ -276,6 +278,56 @@ class StreamVideoItemTest final : public QObject
     };
 
 private slots:
+    void continuousVideoUpdatesRespectPresentationGates()
+    {
+        if (QGuiApplication::platformName() == QStringLiteral("offscreen"))
+            QSKIP("The offscreen platform plugin does not create a QRhi.");
+        const bool enabled = qEnvironmentVariable("OPENNOW_CONTINUOUS_VIDEO_UPDATE") == QStringLiteral("1");
+        CursorSession session;
+        QVERIFY(session.start());
+        QTRY_VERIFY(session.runtime.presentationAllowed());
+        const auto callback = std::make_shared<TestRenderCallback>();
+        auto *item = new StreamVideoItem(session.window.contentItem());
+        item->setInputEnabled(false);
+        item->setSize(session.window.size());
+        item->setVideoSize(session.window.size());
+        item->setRenderCallback(callback);
+        callback->videoReady.store(true);
+        item->requestFrame();
+        QTRY_VERIFY(callback->frameCount.load() > 0);
+        QTest::qWait(100);
+        const auto activeFrames = callback->frameCount.load();
+        if (enabled) {
+            QTRY_VERIFY_WITH_TIMEOUT(callback->frameCount.load() > activeFrames + 2, 1'000);
+        } else {
+            QTest::qWait(100);
+            QCOMPARE(callback->frameCount.load(), activeFrames);
+        }
+        const auto stable = [&callback] {
+            QTest::qWait(100);
+            const auto frames = callback->frameCount.load();
+            QTest::qWait(100);
+            return callback->frameCount.load() == frames;
+        };
+        callback->videoReady.store(false);
+        QVERIFY(stable());
+        callback->videoReady.store(true);
+        item->setVisible(false);
+        QVERIFY(stable());
+        item->setVisible(true);
+        session.window.hide();
+        QVERIFY(stable());
+        session.window.show();
+        item->requestFrame();
+        QTest::qWait(100);
+        QVERIFY(session.runtime.send({{QStringLiteral("type"), QStringLiteral("stop")}}));
+        QVERIFY(!session.runtime.presentationAllowed());
+        QVERIFY(stable());
+        session.runtime.shutdown();
+        QVERIFY(!session.runtime.running());
+        QVERIFY(stable());
+    }
+
     void liveTelemetryIsOptInAndWritesOnlyNumericAllowlistedFields()
     {
         QTemporaryDir directory;
