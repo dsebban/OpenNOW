@@ -273,7 +273,7 @@ fn run() -> Result<(), String> {
 
 /// Persist session lifecycle transitions and failure text; the RPC line above keeps only the code.
 fn record_session_outcome(core: &AppCore, method: &str, result: &DispatchResult) {
-    if !method.starts_with("session.") || method == "session.remote.list" {
+    if !method.starts_with("session.") {
         return;
     }
     match result {
@@ -285,6 +285,8 @@ fn record_session_outcome(core: &AppCore, method: &str, result: &DispatchResult)
                 diagnostics::runtime_failure_reason(message)
             ),
         ),
+        // Remote listings are not the owned session's lifecycle.
+        Ok(_) if method == "session.remote.list" => {}
         Ok((value, _)) => {
             let evidence = diagnostics::session_state_evidence(value);
             let mut last = core
