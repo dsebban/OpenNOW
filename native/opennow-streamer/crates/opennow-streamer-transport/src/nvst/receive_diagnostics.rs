@@ -16,6 +16,7 @@ pub(super) const BIN_NS: u64 = 100_000_000;
 const BIN_COUNT: usize = 1_800;
 const LONG_CAP: usize = 1_024;
 const LONG_NS: u64 = 1_000_000;
+const PHASE_BOUNDARIES: &str = "Receive starts at the existing worker loop-top instant, except ping iterations use a fresh post-ping stamp and sample iterations use the socket-query end. Receive ends immediately after recv_from; Preprocess ends at the original process-call timestamp; Process ends at a fresh post-call stamp. Forward and Service end at the existing post-match instant; Between runs from that completion to the next receive start. Completion excludes diagnostic final bookkeeping; Between includes it. No phase subsampling.";
 
 #[derive(Clone, Copy)]
 pub(super) enum Phase {
@@ -47,6 +48,7 @@ struct Stats {
     max: u64,
 }
 impl Stats {
+    #[inline]
     fn add(&mut self, start: Stamp, end: Stamp) -> u64 {
         let wall = end.wall.saturating_sub(start.wall);
         self.count += 1;
@@ -205,6 +207,13 @@ impl Capture {
                 packets
             );
         }
+        assert_eq!(
+            self.bins
+                .iter()
+                .map(|b| b.phases[Phase::Between as usize].count)
+                .sum::<u64>(),
+            packets.saturating_sub(1)
+        );
         // Missing per-span CPU is intentional; actual sampling errors are separate.
         for stats in self.bins.iter().flat_map(|b| b.phases.iter()) {
             let fields = stats.fields();
@@ -242,9 +251,11 @@ impl Capture {
             self.socket_errors
         );
     }
+    #[inline]
     pub(super) fn stamp(&self) -> Stamp {
         self.stamp_at(Instant::now())
     }
+    #[inline]
     pub(super) fn stamp_at(&self, instant: Instant) -> Stamp {
         // Reuse an existing boundary timestamp without a second clock read.
         // Per-span CPU is deliberately unavailable; only bin snapshots read it.
@@ -256,6 +267,7 @@ impl Capture {
                 .unwrap_or(u64::MAX),
         }
     }
+    #[inline]
     fn bin(&mut self, end: Stamp) -> Option<&mut Bin> {
         let index = (end.wall / BIN_NS) as usize;
         if index >= BIN_COUNT {
@@ -265,6 +277,7 @@ impl Capture {
         self.used = self.used.max(index + 1);
         Some(&mut self.bins[index])
     }
+    #[inline]
     pub(super) fn span(&mut self, phase: Phase, start: Stamp, end: Stamp) {
         let Some(bin) = self.bin(end) else {
             return;
@@ -284,13 +297,67 @@ impl Capture {
             }
         }
     }
-    pub(super) fn before_receive(&mut self) -> Stamp {
-        let stamp = self.stamp();
+    #[inline]
+    pub(super) fn receive_start(
+        &mut self,
+        loop_now: Instant,
+        sampled: Option<Stamp>,
+        pinged: bool,
+    ) -> Stamp {
+        let stamp = sampled.unwrap_or_else(|| {
+            if pinged {
+                self.stamp()
+            } else {
+                self.stamp_at(loop_now)
+            }
+        });
         if let Some(previous) = self.last_service.take() {
             self.span(Phase::Between, previous, stamp);
         }
         stamp
     }
+    #[inline]
+    pub(super) fn receive_returned(
+        &mut self,
+        start: Stamp,
+        bytes: Option<usize>,
+        idle: bool,
+    ) -> Stamp {
+        let end = self.stamp();
+        self.span(Phase::Receive, start, end);
+        self.result(end, bytes, idle);
+        end
+    }
+    #[inline]
+    pub(super) fn process_returned(&mut self, receive_end: Stamp, received_at: Instant) -> Stamp {
+        let end = self.stamp();
+        let start = self.stamp_at(received_at);
+        self.span(Phase::Preprocess, receive_end, start);
+        self.span(Phase::Process, start, end);
+        end
+    }
+    #[inline]
+    pub(super) fn complete_iteration(
+        &mut self,
+        at: Instant,
+        receive_end: Stamp,
+        received: bool,
+        process_end: Option<Stamp>,
+        counts: [u64; 6],
+    ) {
+        let end = self.stamp_at(at);
+        if received {
+            if let Some(process_end) = process_end {
+                self.span(Phase::Forward, process_end, end);
+            } else {
+                self.span(Phase::Preprocess, receive_end, end);
+            }
+            self.span(Phase::Service, receive_end, end);
+        }
+        self.counters(end, counts);
+        self.service_end(end);
+    }
+    #[inline]
     pub(super) fn result(&mut self, end: Stamp, bytes: Option<usize>, idle: bool) {
         if let Some(bin) = self.bin(end) {
             if let Some(bytes) = bytes {
@@ -303,10 +370,12 @@ impl Capture {
             }
         }
     }
+    #[inline]
     pub(super) fn service_end(&mut self, end: Stamp) {
         self.last_service = Some(end);
     }
     // Cumulative receiver counters remain separate from socket successes.
+    #[inline]
     pub(super) fn counters(&mut self, end: Stamp, counts: [u64; 6]) {
         let previous = self.previous_counts;
         self.previous_counts = counts;
@@ -398,7 +467,7 @@ impl Capture {
             "INFO",
             "receive-diag",
             &format!(
-                "schema=1 status=started pid={} tid={} role={} duration_ms=180000 bin_ms=100 timer_origin=worker_setup media_coverage=unverified span_cpu=unsampled",
+                "schema=2 status=started pid={} tid={} role={} duration_ms=180000 bin_ms=100 timer_origin=worker_setup media_coverage=unverified span_cpu=unsampled",
                 capture.pid, capture.tid, capture.role
             ),
         );
@@ -415,24 +484,36 @@ impl Capture {
         CpuSample { before, cpu, after }
     }
     #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
-    pub(super) fn checkpoint(owner: &mut Option<Self>, socket: &std::net::UdpSocket) {
-        use std::os::fd::AsRawFd;
+    #[inline]
+    pub(super) fn checkpoint(
+        owner: &mut Option<Self>,
+        socket: &std::net::UdpSocket,
+        loop_now: Instant,
+    ) -> Option<Stamp> {
         let Some(capture) = owner.as_mut() else {
-            return;
+            return None;
         };
-        // Only wall time is needed for socket brackets. Do not issue a CPU-clock
-        // syscall for every checkpoint when the 100-ms sample is not due.
-        let before = capture
-            .origin
-            .elapsed()
-            .as_nanos()
-            .try_into()
-            .unwrap_or(u64::MAX);
+        // Fast path reuses the ordinary loop clock; no new clock read or syscall.
+        let before = capture.stamp_at(loop_now).wall;
         let complete = before >= BIN_NS * BIN_COUNT as u64;
         let index = (before / BIN_NS).min(BIN_COUNT as u64 - 1) as usize;
         if !complete && capture.bins[index].socket.is_some() {
-            return;
+            return None;
         }
+        Self::sample_bin(owner, socket, before)
+    }
+    #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
+    #[cold]
+    #[inline(never)]
+    fn sample_bin(
+        owner: &mut Option<Self>,
+        socket: &std::net::UdpSocket,
+        before: u64,
+    ) -> Option<Stamp> {
+        use std::os::fd::AsRawFd;
+        let capture = owner.as_mut()?;
+        let complete = before >= BIN_NS * BIN_COUNT as u64;
+        let index = (before / BIN_NS).min(BIN_COUNT as u64 - 1) as usize;
         let cpu_sample = capture.sample_cpu();
         let socket_before = capture.stamp().wall;
         let mut memory = [0u32; 9];
@@ -447,12 +528,7 @@ impl Capture {
                 &mut length,
             )
         };
-        let after = capture
-            .origin
-            .elapsed()
-            .as_nanos()
-            .try_into()
-            .unwrap_or(u64::MAX);
+        let after = capture.stamp().wall;
         // Failed samples are not retried per packet; retain an unavailable marker.
         if result != 0 || length as usize != std::mem::size_of_val(&memory) {
             capture.socket_errors += 1;
@@ -469,10 +545,12 @@ impl Capture {
             if let Some(capture) = owner.take() {
                 capture.export(true);
             }
+            None
         } else {
             capture.bins[index].socket = Some(sample);
             capture.bins[index].cpu_sample = Some(cpu_sample);
             capture.used = capture.used.max(index + 1);
+            Some(Stamp { wall: after })
         }
     }
     #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
@@ -498,7 +576,7 @@ impl Capture {
                 serde_json::json!({"index":index,"phases":phases,"raw":bin.raw,"bytes":bin.bytes,"idle":bin.idle,"errors":bin.errors,"accepted_authenticated":bin.accepted,"assembled":bin.assembled,"repaired":bin.repaired,"stun_ok":bin.handled_stun,"stun_invalid":bin.invalid_stun,"wrong_source":bin.wrong_source,"counter_discontinuities":bin.counter_discontinuities,"socket":socket,"cpu_sample":cpu_sample})
             }).collect();
             let longs: Vec<_> = self.longs.iter().map(|s| serde_json::json!([s.phase,s.start.wall,s.end.wall,null,null])).collect();
-            let mut value = serde_json::json!({"schema":1,"complete":complete,"preallocated_bytes":preallocated_bytes,"elapsed_ns":elapsed,"pid":self.pid,"tid":self.tid,"role":self.role,"realtime_origin_ns":self.realtime_ns,"clock":"Instant-relative-monotonic; realtime anchor approximate only","span_cpu":"unsampled; phase cpu_missing counts intentional absence of per-span CPU coverage","bin_ns":BIN_NS,"phase_names":PHASES,"phase_fields":["count","wall_ns","thread_cpu_ns","cpu_covered_wall_ns","cpu_missing","cpu_invalid","max_wall_ns"],"socket_fields":["before_ns","after_ns","SO_MEMINFO_u32"],"socket_memory_fields":["rmem_alloc","rcvbuf","wmem_alloc","sndbuf","fwd_alloc","wmem_queued","optmem","backlog","drops"],"long_fields":["phase","start_ns","end_ns","start_cpu_ns","end_cpu_ns"],"long_omitted":self.omitted,"cutoff_spans":self.cutoff_spans,"monotonic_anchor":self.monotonic_anchor,"final_socket":self.final_socket.map(|s|serde_json::json!([s.before,s.after,s.memory])),"socket_errors":self.socket_errors,"bins":bins,"long_spans":longs,"limits":"complete means timer reached, not full coverage. Partial exit can omit terminal in-flight phase/counters. Completion bins are not utilization bins. Delivered receive timing only; no kernel arrivals or scheduler trace. Socket drops are interval brackets; memory is not payload bytes. Non-CPU elapsed is not runqueue or blocking attribution."});
+            let mut value = serde_json::json!({"schema":2,"phase_boundaries":PHASE_BOUNDARIES,"complete":complete,"preallocated_bytes":preallocated_bytes,"elapsed_ns":elapsed,"pid":self.pid,"tid":self.tid,"role":self.role,"realtime_origin_ns":self.realtime_ns,"clock":"Instant-relative-monotonic; realtime anchor approximate only","span_cpu":"unsampled; phase cpu_missing counts intentional absence of per-span CPU coverage","bin_ns":BIN_NS,"phase_names":PHASES,"phase_fields":["count","wall_ns","thread_cpu_ns","cpu_covered_wall_ns","cpu_missing","cpu_invalid","max_wall_ns"],"socket_fields":["before_ns","after_ns","SO_MEMINFO_u32"],"socket_memory_fields":["rmem_alloc","rcvbuf","wmem_alloc","sndbuf","fwd_alloc","wmem_queued","optmem","backlog","drops"],"long_fields":["phase","start_ns","end_ns","start_cpu_ns","end_cpu_ns"],"long_omitted":self.omitted,"cutoff_spans":self.cutoff_spans,"monotonic_anchor":self.monotonic_anchor,"final_socket":self.final_socket.map(|s|serde_json::json!([s.before,s.after,s.memory])),"socket_errors":self.socket_errors,"bins":bins,"long_spans":longs,"limits":"complete means timer reached, not full coverage. Partial exit can omit terminal in-flight phase/counters. Completion bins are not utilization bins. Delivered receive timing only; no kernel arrivals or scheduler trace. Socket drops are interval brackets; memory is not payload bytes. Non-CPU elapsed is not runqueue or blocking attribution."});
             value["cpu_sampling"] = serde_json::json!({"policy":"one bracketed thread-CPU snapshot at the first worker opportunity per 100-ms bin, plus final snapshot","fields":["before_ns","thread_cpu_ns","after_ns"],"errors":self.cpu_sample_errors,"final":self.final_cpu_sample.map(|s|serde_json::json!([s.before,s.cpu,s.after])),"limits":"Worker-wide snapshot differences include receive, inline work, housekeeping and diagnostics. No per-span CPU or blocking/preemption/runqueue attribution; delayed worker means delayed snapshots."});
             value["media_coverage"] = serde_json::json!({"timer_origin":"worker_setup","first_authenticated_ns":self.first_authenticated_ns,"last_authenticated_ns":self.last_authenticated_ns,"first_assembled_ns":self.first_assembled_ns,"last_assembled_ns":self.last_assembled_ns,"limits":"Processing-completion endpoints only, not continuous media/decode/presentation or verified scene coverage. Startup is included; scene validation after timer start does not earn 180 seconds of valid scene."});
             value["long_policy"] = serde_json::json!({"threshold_ns":LONG_NS,"capacity":LONG_CAP,"receive_long_excluded":self.receive_long_excluded,"limits":"Receive has aggregate accounting only, never interval-tail records. Other phases share the capped tail pool; no full receive interval trace."});
@@ -570,8 +648,14 @@ mod tests {
         let mut capture = Capture::new();
         capture.output = Some(file);
         let mut owner = Some(capture);
-        Capture::checkpoint(&mut owner, &socket);
+        let loop_now = Instant::now();
+        let sampled = Capture::checkpoint(&mut owner, &socket, loop_now).unwrap();
+        assert!(Capture::checkpoint(&mut owner, &socket, loop_now).is_none());
         let capture = owner.as_mut().unwrap();
+        assert_eq!(
+            sampled.wall,
+            capture.bins.iter().find_map(|b| b.socket).unwrap().after
+        );
         assert_eq!(capture.socket_errors, 0);
         assert!(capture.bins.iter().find_map(|b| b.socket).unwrap().memory[1] > 0);
         let initial_cpu = capture
@@ -590,7 +674,9 @@ mod tests {
         let end = capture.stamp();
         capture.span(Phase::Process, start, end);
         std::thread::sleep(std::time::Duration::from_millis(100));
-        Capture::checkpoint(&mut owner, &socket);
+        let loop_now = Instant::now();
+        let sampled = Capture::checkpoint(&mut owner, &socket, loop_now).unwrap();
+        assert!(Capture::checkpoint(&mut owner, &socket, loop_now).is_none());
         let capture = owner.as_ref().unwrap();
         let final_cpu = capture
             .bins
@@ -609,6 +695,8 @@ mod tests {
             .unwrap();
         let latest_cpu = capture.bins[latest_index].cpu_sample.unwrap();
         let latest_socket = capture.bins[latest_index].socket.unwrap();
+        assert_eq!(sampled.wall, latest_socket.after);
+        assert!(latest_cpu.after <= latest_socket.before && latest_socket.before <= sampled.wall);
         drop(owner); // Early worker exit must export partial, without retaining the socket.
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         let value = loop {
@@ -620,6 +708,8 @@ mod tests {
             assert!(Instant::now() < deadline, "export did not complete");
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
+        assert_eq!(value["schema"], 2);
+        assert_eq!(value["phase_boundaries"], PHASE_BOUNDARIES);
         assert_eq!(value["complete"], false);
         assert_eq!(value["socket_errors"], 0);
         assert_eq!(
@@ -648,6 +738,91 @@ mod tests {
         );
         // Owned disposable fixture only; keep it for inspection rather than deleting it.
         println!("partial_export_fixture={}", path.display());
+    }
+
+    #[test]
+    fn existing_clock_boundaries_preserve_full_phase_and_terminal_accounting() {
+        let mut capture = Capture::new();
+        let at = |ns| capture.origin + std::time::Duration::from_nanos(ns);
+        let loop_now = at(100);
+        let prior_end = at(50);
+        let sample_at = at(200);
+        capture.service_end(stamp(50));
+        let start = capture.receive_start(loop_now, None, false);
+        assert_eq!(start.wall, 100);
+        assert_eq!(
+            capture.bins[0].phases[Phase::Between as usize].fields(),
+            [1, 50, 0, 0, 1, 0, 50]
+        );
+        let receive_end = capture.receive_returned(start, Some(1200), false);
+        let received_at = Instant::now();
+        let process_end = capture.process_returned(receive_end, received_at);
+        let finished = capture.origin + std::time::Duration::from_nanos(process_end.wall + LONG_NS);
+        capture.complete_iteration(
+            finished,
+            receive_end,
+            true,
+            Some(process_end),
+            [1, 1, 1, 0, 0, 0],
+        );
+        let end = capture.stamp_at(finished);
+        let bin = &capture.bins[(end.wall / BIN_NS) as usize];
+        assert_eq!(
+            bin.phases[Phase::Forward as usize].fields(),
+            [1, LONG_NS, 0, 0, 1, 0, LONG_NS]
+        );
+        assert_eq!(
+            bin.phases[Phase::Service as usize].wall,
+            end.wall - receive_end.wall
+        );
+        let total = |field: fn(&Bin) -> u64| capture.bins.iter().map(field).sum::<u64>();
+        assert_eq!(
+            (
+                total(|b| b.raw),
+                total(|b| b.accepted),
+                total(|b| b.assembled),
+                total(|b| b.repaired)
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(capture.last_service.unwrap().wall, end.wall);
+        assert!(
+            capture
+                .longs
+                .iter()
+                .any(|s| s.phase == Phase::Service as usize && s.end.wall == end.wall)
+        );
+        // A sample refresh wins even on a ping iteration, and Between uses that exact boundary.
+        capture.service_end(stamp(50));
+        assert_eq!(
+            capture
+                .receive_start(loop_now, Some(capture.stamp_at(sample_at)), true)
+                .wall,
+            200
+        );
+        let fresh = capture.receive_start(prior_end, None, true);
+        assert!(fresh.wall > capture.stamp_at(prior_end).wall);
+        // STUN/non-process path: full Preprocess/Service without fabricated Process/Forward.
+        let mut stun = Capture::new();
+        let at = stun.origin + std::time::Duration::from_nanos(200);
+        stun.complete_iteration(at, stamp(100), true, None, [0, 0, 0, 1, 0, 0]);
+        assert_eq!(
+            stun.bins[0].phases[Phase::Preprocess as usize].fields(),
+            [1, 100, 0, 0, 1, 0, 100]
+        );
+        assert_eq!(stun.bins[0].phases[Phase::Service as usize].count, 1);
+        assert_eq!(
+            stun.bins[0].phases[Phase::Process as usize].count
+                + stun.bins[0].phases[Phase::Forward as usize].count,
+            0
+        );
+        assert_eq!(stun.bins[0].handled_stun, 1);
+        // Idle completion still advances counters/end but adds no Service or inner span.
+        let at = stun.origin + std::time::Duration::from_nanos(300);
+        stun.complete_iteration(at, stamp(250), false, None, [0, 0, 0, 2, 0, 0]);
+        assert_eq!(stun.bins[0].phases[Phase::Service as usize].count, 1);
+        assert_eq!(stun.bins[0].handled_stun, 2);
+        assert_eq!(stun.last_service.unwrap().wall, 300);
     }
 
     #[test]

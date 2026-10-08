@@ -7489,32 +7489,26 @@ fn run_nvst_udp_receiver(
         }
 
         #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
-        receive_diagnostics::Capture::checkpoint(&mut diagnostic, &socket);
-        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
-        let receive_start = diagnostic.as_mut().map(|d| d.before_receive());
+        let receive_start = {
+            let sampled = receive_diagnostics::Capture::checkpoint(&mut diagnostic, &socket, now);
+            diagnostic
+                .as_mut()
+                .map(|d| d.receive_start(now, sampled, last_ping == now))
+        };
         let receive_result = socket.recv_from(&mut datagram);
         #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
         let receive_end = diagnostic.as_mut().map(|d| {
-            let end = d.stamp();
-            d.span(
-                receive_diagnostics::Phase::Receive,
+            d.receive_returned(
                 receive_start.unwrap(),
-                end,
-            );
-            d.result(
-                end,
                 receive_result.as_ref().ok().map(|(length, _)| *length),
                 receive_result
                     .as_ref()
                     .err()
                     .is_some_and(udp_receive_is_idle),
-            );
-            end
+            )
         });
         #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
-        let mut did_process = false;
-        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
-        let mut forward_finished = None;
+        let mut process_end = None;
         #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
         let received_datagram = receive_result.is_ok();
         match receive_result {
@@ -7579,19 +7573,11 @@ fn run_nvst_udp_receiver(
                 let received_at = Instant::now();
                 let events = receiver.process_datagram(source, &datagram[..length], received_at);
                 #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
-                let process_end = diagnostic.as_mut().map(|d| {
-                    let end = d.stamp();
-                    // Reuse the existing protocol timestamp at the exact process-call boundary.
-                    let start = d.stamp_at(received_at);
-                    did_process = true;
-                    d.span(
-                        receive_diagnostics::Phase::Preprocess,
-                        receive_end.unwrap(),
-                        start,
-                    );
-                    d.span(receive_diagnostics::Phase::Process, start, end);
-                    end
-                });
+                {
+                    process_end = diagnostic
+                        .as_mut()
+                        .map(|d| d.process_returned(receive_end.unwrap(), received_at));
+                }
                 if !authenticated_before {
                     feedback.record_socket_receive(
                         StreamSocket::Video,
@@ -7612,31 +7598,24 @@ fn run_nvst_udp_receiver(
                     ) {
                         #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
                         if let Some(d) = diagnostic.as_mut() {
-                            let end = d.stamp();
-                            d.span(
-                                receive_diagnostics::Phase::Forward,
-                                process_end.unwrap(),
-                                end,
-                            );
-                            d.span(
-                                receive_diagnostics::Phase::Service,
+                            d.complete_iteration(
+                                Instant::now(),
                                 receive_end.unwrap(),
-                                end,
+                                true,
+                                process_end,
+                                [
+                                    receiver.authenticated_packets,
+                                    receiver.frames_emitted,
+                                    receiver.fec_repaired_packets,
+                                    handled_stun,
+                                    invalid_stun,
+                                    wrong_source,
+                                ],
                             );
                         }
                         forward_optional(&event_sender, receiver.stop());
                         return;
                     }
-                }
-                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
-                if let Some(d) = diagnostic.as_mut() {
-                    let end = d.stamp();
-                    d.span(
-                        receive_diagnostics::Phase::Forward,
-                        process_end.unwrap(),
-                        end,
-                    );
-                    forward_finished = Some(end);
                 }
             }
             Err(error) if udp_receive_is_idle(&error) => {
@@ -7654,25 +7633,14 @@ fn run_nvst_udp_receiver(
                 return;
             }
         }
+        let now = Instant::now();
         #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
         if let Some(d) = diagnostic.as_mut() {
-            let end = forward_finished.unwrap_or_else(|| d.stamp());
-            if received_datagram {
-                if !did_process {
-                    d.span(
-                        receive_diagnostics::Phase::Preprocess,
-                        receive_end.unwrap(),
-                        end,
-                    );
-                }
-                d.span(
-                    receive_diagnostics::Phase::Service,
-                    receive_end.unwrap(),
-                    end,
-                );
-            }
-            d.counters(
-                end,
+            d.complete_iteration(
+                now,
+                receive_end.unwrap(),
+                received_datagram,
+                process_end,
                 [
                     receiver.authenticated_packets,
                     receiver.frames_emitted,
@@ -7682,9 +7650,7 @@ fn run_nvst_udp_receiver(
                     wrong_source,
                 ],
             );
-            d.service_end(end);
         }
-        let now = Instant::now();
         if let Some(report) = receiver.poll_receiver_report(now) {
             if let Err(error) = socket.send_to(&report, receiver.config.video_peer) {
                 if !udp_icmp_port_unreachable(&error) {

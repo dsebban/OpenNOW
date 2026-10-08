@@ -51,6 +51,7 @@ struct PacketCost {
     process_ns: u64,
     forward_ns: u64,
     service_ns: u64,
+    bracketed_ns: u64,
     authenticated_delta: u64,
     frames_forwarded: u64,
     repaired_delta: u64,
@@ -212,6 +213,9 @@ fn receive_diagnostic_hook_cost_report() {
         "diagnostic overhead requires an optimized release build"
     );
     let fixture = fixture(100, Case::Repair, 630);
+    let mut gate_costs = Vec::with_capacity(3);
+    let mut gate_p99 = Vec::with_capacity(3);
+    let mut legacy_costs = Vec::with_capacity(3);
     for (pair, instrumented_first) in [false, true, false].into_iter().enumerate() {
         let first = replay(&fixture, 30, instrumented_first);
         let second = replay(&fixture, 30, !instrumented_first);
@@ -220,9 +224,22 @@ fn receive_diagnostic_hook_cost_report() {
         } else {
             (first, second)
         };
-        let total = |costs: &[PacketCost]| costs.iter().map(|c| c.service_ns).sum::<u64>();
-        let ordinary_total = total(&ordinary);
-        let instrumented_total = total(&instrumented);
+        let ordinary_total = ordinary.iter().map(|c| c.service_ns).sum::<u64>();
+        let instrumented_total = instrumented.iter().map(|c| c.service_ns).sum::<u64>();
+        let ordinary_bracketed = ordinary.iter().map(|c| c.bracketed_ns).sum::<u64>();
+        let instrumented_bracketed = instrumented.iter().map(|c| c.bracketed_ns).sum::<u64>();
+        let ordinary_distribution = distribution(ordinary.iter().map(|c| c.bracketed_ns));
+        let instrumented_distribution = distribution(instrumented.iter().map(|c| c.bracketed_ns));
+        let increase = |after: f64, before: f64| 100.0 * (after / before - 1.0);
+        let symmetric = increase(instrumented_bracketed as f64, ordinary_bracketed as f64);
+        let p99 = increase(
+            instrumented_distribution["p99_us"].as_f64().unwrap(),
+            ordinary_distribution["p99_us"].as_f64().unwrap(),
+        );
+        let legacy = increase(instrumented_bracketed as f64, ordinary_total as f64);
+        gate_costs.push(symmetric);
+        gate_p99.push(p99);
+        legacy_costs.push(legacy);
         println!(
             "RECEIVE_DIAGNOSTIC_OVERHEAD {}",
             json!({
@@ -230,13 +247,33 @@ fn receive_diagnostic_hook_cost_report() {
                 "packets_per_pass":ordinary.len(), "frames_per_pass":600,
                 "ordinary_total_ns":ordinary_total,"instrumented_total_ns":instrumented_total,
                 "total_increase_percent":100.0 * (instrumented_total as f64 / ordinary_total as f64 - 1.0),
+                "ordinary_bracketed_ns":ordinary_bracketed,"instrumented_bracketed_ns":instrumented_bracketed,
+                "symmetric_increase_percent":symmetric,"symmetric_p99_change_percent":p99,
+                "asymmetric_legacy_increase_percent":legacy,
+                "ordinary_bracketed":ordinary_distribution,"instrumented_bracketed":instrumented_distribution,
+                "bracket":"Admission: loop-top through post-completion bracket-end in BOTH modes; same common reads. R1 service: finished-start. Legacy structure: instrumented bracket versus ordinary R1 service, informational only; not a historical rescore or identical historical workload.",
                 "ordinary_service":distribution(ordinary.iter().map(|c|c.service_ns)),
                 "instrumented_service":distribution(instrumented.iter().map(|c|c.service_ns)),
             "linux_bin_cpu_and_socket_hooks":cfg!(all(target_os="linux",feature="receive-diagnostics")),
-            "limits":"Fixture hook cost only; no recv syscall, exporter or target scheduling. Enabled Linux also exercises actual per-bin CPU and SO_MEMINFO queries on an idle loopback socket; phase stamps are wall-only. Non-Linux has no thread-CPU reads. Not target evidence or a gain claim."
+            "limits":"H2 schema2 full-coverage hook cost only; no recv syscall, exporter or live scheduling. Both modes include common loop-top/process/processed/finished/bracket-end reads; Linux exercises actual per-bin CPU and SO_MEMINFO on idle loopback. Wall-only phases; CPU snapshots do not assign per-span cause. Clock dominance unproved. Passing admits one capture, not a gain or historical FAIL rescore."
             })
         );
     }
+    let median = |mut values: Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        values[1]
+    };
+    let cost = median(gate_costs);
+    let p99 = median(gate_p99);
+    let legacy = median(legacy_costs);
+    println!(
+        "RECEIVE_DIAGNOSTIC_ADMISSION {}",
+        json!({"schema":2,"pairs":3,
+        "median_symmetric_increase_percent":cost,"median_symmetric_p99_change_percent":p99,
+        "median_asymmetric_legacy_increase_percent":legacy,"cost_threshold_percent":5.0,"p99_threshold_percent":5.0,
+        "verdict":if cost <= 5.0 && p99 <= 5.0 { "PASS" } else { "FAIL" },
+        "limits":"Prospective H2 gate only; validity assertions mandatory; no row-bearing retry or historical rescoring."})
+    );
 }
 
 fn nanos(duration: Duration) -> u64 {
@@ -272,38 +309,28 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
         let now = origin + Duration::from_nanos(packet.arrival_ns);
         let accepted = receiver.authenticated_packets;
         let repaired = receiver.fec_repaired_packets;
-        let outer_start = diagnostic_hooks.then(Instant::now);
+        // Identical common reads/brackets in both modes; runtime already has loop-top/end clocks.
+        let loop_top = Instant::now();
+        #[cfg(not(all(target_os = "linux", feature = "receive-diagnostics")))]
+        let sampled = None;
         #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
-        if let Some(socket) = diagnostic_socket.as_ref() {
-            super::super::receive_diagnostics::Capture::checkpoint(&mut diagnostic, socket);
-        }
+        let sampled = diagnostic_socket.as_ref().and_then(|socket| {
+            super::super::receive_diagnostics::Capture::checkpoint(
+                &mut diagnostic,
+                socket,
+                loop_top,
+            )
+        });
         let hook_start = diagnostic.as_mut().map(|d| {
-            use super::super::receive_diagnostics::Phase;
-            let entered = d.before_receive();
-            let returned = d.stamp();
-            d.span(Phase::Receive, entered, returned);
-            d.result(returned, Some(packet.datagram.len()), false);
-            returned
+            let entered = d.receive_start(loop_top, sampled, false);
+            d.receive_returned(entered, Some(packet.datagram.len()), false)
         });
         let start = Instant::now();
         let received = receiver.process_datagram(packet.source, &packet.datagram, now);
         let processed = Instant::now();
-        let hook_processed = diagnostic.as_mut().map(|d| {
-            let end = d.stamp();
-            // Runtime also has this exact pre-process timestamp; end stamps remain added cost.
-            let process_start = d.stamp_at(start);
-            d.span(
-                super::super::receive_diagnostics::Phase::Preprocess,
-                hook_start.unwrap(),
-                process_start,
-            );
-            d.span(
-                super::super::receive_diagnostics::Phase::Process,
-                process_start,
-                end,
-            );
-            end
-        });
+        let hook_processed = diagnostic
+            .as_mut()
+            .map(|d| d.process_returned(hook_start.unwrap(), start));
         let mut forwarded = 0;
         for event in received {
             forwarded += u64::from(matches!(event, NvstReceiveEvent::Frame(_)));
@@ -313,12 +340,11 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
         }
         let finished = Instant::now();
         if let Some(d) = diagnostic.as_mut() {
-            use super::super::receive_diagnostics::Phase;
-            let end = d.stamp();
-            d.span(Phase::Forward, hook_processed.unwrap(), end);
-            d.span(Phase::Service, hook_start.unwrap(), end);
-            d.counters(
-                end,
+            d.complete_iteration(
+                finished,
+                hook_start.unwrap(),
+                true,
+                hook_processed,
                 [
                     receiver.authenticated_packets,
                     receiver.frames_emitted,
@@ -328,20 +354,22 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
                     0,
                 ],
             );
-            d.service_end(end);
         }
-        let outer_elapsed = outer_start.map(|start| nanos(start.elapsed()));
+        let bracket_end = Instant::now();
         let cost = PacketCost {
             replay_ordinal,
             elapsed_ns: nanos(start - origin),
             process_ns: nanos(processed - start),
             forward_ns: nanos(finished - processed),
-            service_ns: outer_elapsed.unwrap_or_else(|| nanos(finished - start)),
+            service_ns: nanos(finished - start), // R1 definition unchanged in both modes.
+            bracketed_ns: nanos(bracket_end - loop_top),
             authenticated_delta: receiver.authenticated_packets - accepted,
             frames_forwarded: forwarded,
             repaired_delta: receiver.fec_repaired_packets - repaired,
         };
         // All semantic checking, admission feedback and draining stay outside timed service.
+        assert_eq!(cost.service_ns, cost.process_ns + cost.forward_ns);
+        assert!(cost.bracketed_ns >= cost.service_ns);
         assert_eq!(
             cost.authenticated_delta, 1,
             "every timed packet must authenticate"
@@ -379,7 +407,9 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
     assert_eq!(stage.undelivered_frames_total, 0);
     assert_eq!(stage.pending_deliveries, 0);
     // Observe and validate accumulator work after all timed packet service.
-    if let Some(capture) = std::hint::black_box(diagnostic.as_ref()) {
+    if diagnostic_hooks {
+        let capture = std::hint::black_box(diagnostic.as_ref())
+            .expect("instrumented fixture capture disappeared");
         capture.assert_fixture(
             fixture.packets.len() as u64,
             frame_count as u64,
@@ -404,6 +434,7 @@ fn traversal(fixture: &Fixture, warmup: usize) -> Vec<PacketCost> {
             process_ns: nanos(processed - start),
             forward_ns: nanos(finished - processed),
             service_ns: nanos(finished - start),
+            bracketed_ns: nanos(finished - start), // Traversal is not diagnostic admission.
             authenticated_delta: 0,
             frames_forwarded: 0,
             repaired_delta: 0,
@@ -593,6 +624,34 @@ fn authenticated_frames_survive_rollover_reorder_and_real_fec_repair() {
     assert_eq!(
         costs.iter().map(|cost| cost.frames_forwarded).sum::<u64>(),
         3
+    );
+    let instrumented = replay(&repair, 0, true);
+    assert_eq!(
+        instrumented
+            .iter()
+            .map(|cost| cost.repaired_delta)
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(
+        instrumented
+            .iter()
+            .map(|cost| cost.frames_forwarded)
+            .sum::<u64>(),
+        3
+    );
+    assert_eq!(
+        instrumented
+            .iter()
+            .map(|cost| cost.authenticated_delta)
+            .sum::<u64>(),
+        repair.packets.len() as u64
+    );
+    assert!(
+        instrumented
+            .iter()
+            .all(|cost| cost.bracketed_ns >= cost.service_ns
+                && cost.service_ns == cost.process_ns + cost.forward_ns)
     );
     let mut reordered = fixture(50, Case::Burst, 3);
     // Reorder packet contents, not the monotonic arrival clock.
