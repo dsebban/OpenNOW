@@ -328,3 +328,73 @@ fn live_control_ping_rejects_unbounded_partial_response() {
     assert_eq!(ping.ping_ms(Instant::now()), None);
     active.shutdown();
 }
+
+fn exit_reason(mut active: ActiveNvstRtspSession) -> String {
+    let worker = active.worker.take().unwrap();
+    wait_until(|| worker.is_finished());
+    worker.join().unwrap()
+}
+
+#[test]
+fn live_control_exit_records_server_close_code_and_reason() {
+    use tungstenite::protocol::CloseFrame;
+    use tungstenite::protocol::frame::coding::CloseCode;
+    let (client, mut server) = socket_pair();
+    let ping = NvstControlPing::default();
+    let active = active_session(client, &ping);
+    server
+        .close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: "session\nexpired".into(),
+        }))
+        .unwrap();
+    let reason = exit_reason(active);
+    assert_eq!(reason, "server-close code=1008 reason=\"session?expired\"");
+}
+
+#[test]
+fn live_control_exit_records_unparseable_server_request_head() {
+    let (client, mut server) = socket_pair();
+    let ping = NvstControlPing::default();
+    let active = active_session(client, &ping);
+    server
+        .send(Message::Text(
+            "TEARDOWN rtsps://seat.nvidiagrid.net:322 RTSP/1.0\r\nCSeq: 1\r\n\r\n".into(),
+        ))
+        .unwrap();
+    let reason = exit_reason(active);
+    assert!(
+        reason.starts_with(
+            "unparseable-server-message head=\"TEARDOWN rtsps://seat.nvidiagrid.net:322 RTSP/1.0\""
+        ),
+        "{reason}"
+    );
+}
+
+#[test]
+fn live_control_exit_survives_mismatched_response_and_reports_shutdown() {
+    let (client, mut server) = socket_pair();
+    let ping = NvstControlPing::default();
+    let active = active_session(client, &ping);
+    server
+        .send(Message::Text("RTSP/1.0 200 OK\r\nCSeq: 3\r\n\r\n".into()))
+        .unwrap();
+    server_ping(&mut server);
+    assert!(!active.worker.as_ref().unwrap().is_finished());
+    active.control.send(Control::Shutdown).unwrap();
+    assert!(matches!(server.read().unwrap(), Message::Close(_)));
+    assert_eq!(exit_reason(active), "local-shutdown");
+}
+
+#[test]
+fn live_control_exit_records_transport_loss() {
+    let (client, server) = socket_pair();
+    let ping = NvstControlPing::default();
+    let active = active_session(client, &ping);
+    drop(server);
+    let reason = exit_reason(active);
+    assert!(
+        reason.starts_with("read-failed ") || reason.starts_with("ping-send-failed "),
+        "{reason}"
+    );
+}

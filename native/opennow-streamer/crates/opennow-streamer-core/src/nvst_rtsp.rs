@@ -737,7 +737,21 @@ enum Control {
 
 pub struct ActiveNvstRtspSession {
     control: Sender<Control>,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<String>>,
+}
+
+/// Bounded, single-line excerpt of server-supplied text for diagnostics.
+fn printable_excerpt(text: &str, limit: usize) -> String {
+    text.chars()
+        .take(limit)
+        .map(|character| {
+            if character.is_ascii_graphic() || character == ' ' {
+                character
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 impl ActiveNvstRtspSession {
@@ -751,14 +765,21 @@ impl ActiveNvstRtspSession {
         let worker = thread::Builder::new()
             .name("opennow-nvst-rtsps".to_owned())
             .spawn(move || {
-                let mut last_ping = Instant::now();
+                // The keepalive leg outlives every RTSP request, so its end is the only
+                // control-plane evidence when media stops. Record why it ended exactly once.
+                let started = Instant::now();
+                let mut last_ping = started;
+                let mut last_inbound = started;
                 let mut outstanding: Option<(u64, Instant)> = None;
                 let mut ping_sequence = 0u64;
-                loop {
+                let mut pongs = 0u64;
+                let mut missed = 0u64;
+                let mut missing_since: Option<Instant> = None;
+                let reason = loop {
                     if receiver.try_recv().is_ok() {
                         control_ping.clear();
                         let _ = client.socket.close(None);
-                        break;
+                        break "local-shutdown".to_owned();
                     }
                     let now = Instant::now();
                     if outstanding.is_some_and(|(_, sent_at)| {
@@ -766,63 +787,136 @@ impl ActiveNvstRtspSession {
                     }) {
                         outstanding = None;
                         control_ping.clear();
+                        missed += 1;
+                        if missing_since.is_none() {
+                            missing_since = Some(now);
+                            opennow_streamer_protocol::log::log_line(
+                                "WARN",
+                                "rtsps",
+                                &format!(
+                                    "control_pong_missing seq={ping_sequence} uptime_ms={} last_inbound_ms_ago={}",
+                                    now.duration_since(started).as_millis(),
+                                    now.duration_since(last_inbound).as_millis()
+                                ),
+                            );
+                        }
                     }
                     if outstanding.is_none() && now.duration_since(last_ping) >= KEEPALIVE_INTERVAL
                     {
                         ping_sequence = ping_sequence.wrapping_add(1);
-                        if client
+                        if let Err(error) = client
                             .socket
                             .send(Message::Ping(ping_sequence.to_be_bytes().to_vec().into()))
-                            .is_err()
                         {
-                            break;
+                            break format!("ping-send-failed error={error}");
                         }
                         outstanding = Some((ping_sequence, now));
                         last_ping = now;
                     }
-                    match client.socket.read() {
+                    let message = client.socket.read();
+                    if message.is_ok() {
+                        last_inbound = Instant::now();
+                    }
+                    match message {
                         Ok(Message::Text(text)) => client.buffer.push_str(text.as_str()),
                         Ok(Message::Binary(bytes)) => {
                             client.buffer.push_str(&String::from_utf8_lossy(&bytes));
                         }
                         Ok(Message::Ping(bytes)) => {
-                            if client.socket.send(Message::Pong(bytes)).is_err() {
-                                break;
+                            if let Err(error) = client.socket.send(Message::Pong(bytes)) {
+                                break format!("pong-send-failed error={error}");
                             }
                         }
                         Ok(Message::Pong(bytes)) => {
                             if let Some((sequence, sent_at)) = outstanding {
                                 if bytes.as_ref() == sequence.to_be_bytes() {
                                     outstanding = None;
-                                    control_ping.record(sent_at, Instant::now());
+                                    pongs += 1;
+                                    let received_at = Instant::now();
+                                    control_ping.record(sent_at, received_at);
+                                    if let Some(since) = missing_since.take() {
+                                        opennow_streamer_protocol::log::log_line(
+                                            "INFO",
+                                            "rtsps",
+                                            &format!(
+                                                "control_pong_recovered seq={sequence} gap_ms={}",
+                                                received_at.duration_since(since).as_millis()
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                         }
-                        Ok(Message::Close(_)) => break,
+                        Ok(Message::Close(frame)) => {
+                            break match frame {
+                                Some(frame) => format!(
+                                    "server-close code={} reason={:?}",
+                                    u16::from(frame.code),
+                                    printable_excerpt(frame.reason.as_str(), 160)
+                                ),
+                                None => "server-close code=none".to_owned(),
+                            };
+                        }
                         Ok(_) => {}
                         Err(tungstenite::Error::Io(error))
                             if matches!(
                                 error.kind(),
                                 ErrorKind::WouldBlock | ErrorKind::TimedOut
                             ) => {}
-                        Err(_) => break,
+                        Err(error) => break format!("read-failed error={error}"),
                     }
                     if client.buffer.len() > MAX_CONTROL_RESPONSE_BYTES {
-                        break;
+                        break format!("buffer-overflow bytes={}", client.buffer.len());
                     }
+                    let mut parse_failure = None;
                     while !client.buffer.is_empty() {
+                        let head = printable_excerpt(
+                            client.buffer.lines().next().unwrap_or_default(),
+                            160,
+                        );
                         match take_rtsp_response(&mut client.buffer, client.cseq) {
-                            Ok(Some(_)) => {}
+                            Ok(Some(response)) => opennow_streamer_protocol::log::log_line(
+                                "INFO",
+                                "rtsps",
+                                &format!(
+                                    "control_response status={} text={:?}",
+                                    response.status,
+                                    printable_excerpt(&response.status_text, 80)
+                                ),
+                            ),
                             Ok(None) => break,
-                            Err(error) if error.code == "nvst-rtsp-sequence-mismatch" => {}
-                            Err(_) => {
-                                control_ping.clear();
-                                return;
+                            Err(error) if error.code == "nvst-rtsp-sequence-mismatch" => {
+                                opennow_streamer_protocol::log::log_line(
+                                    "WARN",
+                                    "rtsps",
+                                    &format!("control_unsolicited head={head:?} {}", error.message),
+                                );
+                            }
+                            Err(error) => {
+                                parse_failure = Some(format!(
+                                    "unparseable-server-message head={head:?} error={}",
+                                    error.message
+                                ));
+                                break;
                             }
                         }
                     }
-                }
+                    if let Some(failure) = parse_failure {
+                        break failure;
+                    }
+                };
                 control_ping.clear();
+                let ended = Instant::now();
+                opennow_streamer_protocol::log::log_line(
+                    if reason == "local-shutdown" { "INFO" } else { "WARN" },
+                    "rtsps",
+                    &format!(
+                        "control_exit reason={reason} uptime_ms={} pings_sent={ping_sequence} pongs={pongs} missed_pongs={missed} last_inbound_ms_ago={}",
+                        ended.duration_since(started).as_millis(),
+                        ended.duration_since(last_inbound).as_millis()
+                    ),
+                );
+                reason
             })
             .map_err(|error| NvstRtspError::new("nvst-control-failed", error.to_string()))?;
         Ok(Self {

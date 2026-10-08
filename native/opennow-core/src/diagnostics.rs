@@ -32,6 +32,41 @@ pub fn stream_profile_evidence(session: &Value) -> Value {
     evidence
 }
 
+/// Identifier-free session lifecycle summary. Session results otherwise reach only the Qt
+/// process, so a stream that ends cloud-side leaves no persistent status or termination trail.
+pub fn session_state_evidence(result: &Value) -> String {
+    let session = if result.get("session").is_some() {
+        &result["session"]
+    } else {
+        result
+    };
+    if session.is_null() {
+        return json!({"session": null}).to_string();
+    }
+    let short = |value: &Value| {
+        value
+            .as_str()
+            .map(|text| text.chars().take(48).collect::<String>())
+    };
+    let termination = &session["termination"];
+    json!({
+        "status": session["status"].as_i64(),
+        "phase": short(&session["phase"]),
+        "seatSetupStep": session["seatSetupStep"].as_i64(),
+        "queuePosition": session["queuePosition"].as_i64(),
+        "termination": if termination.is_object() {
+            json!({
+                "source": short(&termination["source"]),
+                "status": termination["status"].as_i64(),
+                "resumable": termination["resumable"].as_bool()
+            })
+        } else {
+            Value::Null
+        }
+    })
+    .to_string()
+}
+
 pub fn native_runtime_evidence(capabilities: &Value) -> Value {
     let mut evidence = serde_json::Map::new();
     for field in [
@@ -545,6 +580,26 @@ fn redact_lines(value: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn session_state_evidence_keeps_lifecycle_fields_without_identifiers() {
+        let evidence = session_state_evidence(&json!({"session":{
+            "sessionId":"secret-session","serverIp":"203.0.113.9","status":7,"phase":"finished",
+            "seatSetupStep":0,"queuePosition":null,
+            "termination":{"source":"cloudmatch-session-status","status":7,"sessionId":"secret-session","resumable":false}
+        }}));
+        assert!(!evidence.contains("secret-session"));
+        assert!(!evidence.contains("203.0.113.9"));
+        let parsed: Value = serde_json::from_str(&evidence).unwrap();
+        assert_eq!(parsed["status"], 7);
+        assert_eq!(parsed["phase"], "finished");
+        assert_eq!(parsed["termination"]["source"], "cloudmatch-session-status");
+        assert_eq!(parsed["termination"]["resumable"], false);
+        assert_eq!(
+            session_state_evidence(&json!({"session":null})),
+            r#"{"session":null}"#
+        );
+    }
 
     #[test]
     fn diagnostics_rotate_during_a_session_and_replace_the_previous_log() {

@@ -58,6 +58,7 @@ struct AppCore {
     gfn: Arc<GfnService>,
     streamer: StreamerService,
     diagnostics: diagnostics::DiagnosticsService,
+    last_session_state: Mutex<String>,
     media: media::MediaService,
     updater: updater::UpdaterService,
     push: Mutex<push_registry::PushRegistry>,
@@ -132,6 +133,7 @@ fn run() -> Result<(), String> {
         streamer: StreamerService::new(),
         diagnostics: diagnostics::DiagnosticsService::new(&data_dir)
             .map_err(|error| format!("Could not initialize diagnostics: {error}"))?,
+        last_session_state: Mutex::new(String::new()),
         media: media::MediaService::new()
             .map_err(|error| format!("Could not initialize media library: {error}"))?,
         updater: updater::UpdaterService::new(&data_dir)
@@ -204,6 +206,7 @@ fn run() -> Result<(), String> {
                 &method,
                 format!("outcome={outcome} durationMs={}", started.elapsed().as_millis()),
             );
+            record_session_outcome(&worker_core, &method, &result);
             let was_cancelled = permit.token.cancelled();
             if method == "session.create"
                 && let Err((code, message)) = &result
@@ -266,6 +269,35 @@ fn run() -> Result<(), String> {
         }).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// Persist session lifecycle transitions and failure text; the RPC line above keeps only the code.
+fn record_session_outcome(core: &AppCore, method: &str, result: &DispatchResult) {
+    if !method.starts_with("session.") || method == "session.remote.list" {
+        return;
+    }
+    match result {
+        Err((code, message)) => core.diagnostics.record(
+            "session",
+            "rpc-error",
+            format!(
+                "method={method} code={code} message={}",
+                diagnostics::runtime_failure_reason(message)
+            ),
+        ),
+        Ok((value, _)) => {
+            let evidence = diagnostics::session_state_evidence(value);
+            let mut last = core
+                .last_session_state
+                .lock()
+                .expect("session state poisoned");
+            if *last != evidence {
+                core.diagnostics
+                    .record("session", "state", format!("method={method} {evidence}"));
+                *last = evidence;
+            }
+        }
+    }
 }
 
 type DispatchResult = Result<(Value, Option<(&'static str, Value)>), (String, String)>;
