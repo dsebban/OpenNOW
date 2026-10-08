@@ -38,18 +38,12 @@ const PHASES: [&str; 6] = [
 #[derive(Clone, Copy)]
 pub(super) struct Stamp {
     pub wall: u64,
-    cpu: Option<u64>,
 }
 
 #[derive(Clone, Copy, Default)]
 struct Stats {
     count: u64,
     wall: u64,
-    cpu: u64,
-    #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
-    cpu_covered_wall: u64,
-    cpu_missing: u64,
-    cpu_invalid: u64,
     max: u64,
 }
 impl Stats {
@@ -58,18 +52,12 @@ impl Stats {
         self.count += 1;
         self.wall += wall;
         self.max = self.max.max(wall);
-        match (start.cpu, end.cpu) {
-            (Some(a), Some(b)) if b >= a && b - a <= wall => {
-                self.cpu += b - a;
-                #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
-                {
-                    self.cpu_covered_wall += wall;
-                }
-            }
-            (Some(_), Some(_)) => self.cpu_invalid += 1,
-            _ => self.cpu_missing += 1,
-        }
         wall
+    }
+    // Preserve the export schema without maintaining unavailable per-span CPU
+    // state on every phase: zero CPU/coverage/invalid, intentionally missing=count.
+    fn fields(&self) -> [u64; 7] {
+        [self.count, self.wall, 0, 0, self.count, 0, self.max]
     }
 }
 #[derive(Clone, Default)]
@@ -219,9 +207,11 @@ impl Capture {
         }
         // Missing per-span CPU is intentional; actual sampling errors are separate.
         for stats in self.bins.iter().flat_map(|b| b.phases.iter()) {
-            assert_eq!(stats.cpu_missing, stats.count);
-            assert_eq!(stats.cpu, 0);
-            assert_eq!(stats.cpu_invalid, 0);
+            let fields = stats.fields();
+            assert_eq!(fields[4], stats.count);
+            assert_eq!(fields[2], 0);
+            assert_eq!(fields[3], 0);
+            assert_eq!(fields[5], 0);
         }
         assert_eq!(self.omitted, 0);
         assert_eq!(self.cutoff_spans, 0);
@@ -253,16 +243,17 @@ impl Capture {
         );
     }
     pub(super) fn stamp(&self) -> Stamp {
-        // Per-packet CPU-clock syscalls materially perturb receive service.
-        // Preserve every wall boundary; CPU coverage is only per-bin brackets.
+        self.stamp_at(Instant::now())
+    }
+    pub(super) fn stamp_at(&self, instant: Instant) -> Stamp {
+        // Reuse an existing boundary timestamp without a second clock read.
+        // Per-span CPU is deliberately unavailable; only bin snapshots read it.
         Stamp {
-            wall: self
-                .origin
-                .elapsed()
+            wall: instant
+                .duration_since(self.origin)
                 .as_nanos()
                 .try_into()
                 .unwrap_or(u64::MAX),
-            cpu: None,
         }
     }
     fn bin(&mut self, end: Stamp) -> Option<&mut Bin> {
@@ -282,7 +273,7 @@ impl Capture {
         if bin.phases[phase].add(start, end) >= LONG_NS {
             if phase == Phase::Receive as usize {
                 // Normal blocking receive waits must not evict rare inline-work tails.
-                // Their aggregate count/max/CPU/missing accounting above is unchanged.
+                // Aggregate count/max stays complete; missing CPU is derived at export.
                 self.receive_long_excluded += 1;
                 return;
             }
@@ -501,12 +492,12 @@ impl Capture {
             use std::io::Write;
             let mut output = std::io::BufWriter::new(output);
             let bins: Vec<_> = self.bins[..self.used].iter().enumerate().map(|(index, bin)| {
-                let phases: Vec<_> = bin.phases.iter().map(|s| serde_json::json!([s.count,s.wall,s.cpu,s.cpu_covered_wall,s.cpu_missing,s.cpu_invalid,s.max])).collect();
+                let phases: Vec<_> = bin.phases.iter().map(|s| serde_json::json!(s.fields())).collect();
                 let socket = bin.socket.map(|s| serde_json::json!([s.before,s.after,s.memory]));
                 let cpu_sample = bin.cpu_sample.map(|s| serde_json::json!([s.before,s.cpu,s.after]));
                 serde_json::json!({"index":index,"phases":phases,"raw":bin.raw,"bytes":bin.bytes,"idle":bin.idle,"errors":bin.errors,"accepted_authenticated":bin.accepted,"assembled":bin.assembled,"repaired":bin.repaired,"stun_ok":bin.handled_stun,"stun_invalid":bin.invalid_stun,"wrong_source":bin.wrong_source,"counter_discontinuities":bin.counter_discontinuities,"socket":socket,"cpu_sample":cpu_sample})
             }).collect();
-            let longs: Vec<_> = self.longs.iter().map(|s| serde_json::json!([s.phase,s.start.wall,s.end.wall,s.start.cpu,s.end.cpu])).collect();
+            let longs: Vec<_> = self.longs.iter().map(|s| serde_json::json!([s.phase,s.start.wall,s.end.wall,null,null])).collect();
             let mut value = serde_json::json!({"schema":1,"complete":complete,"preallocated_bytes":preallocated_bytes,"elapsed_ns":elapsed,"pid":self.pid,"tid":self.tid,"role":self.role,"realtime_origin_ns":self.realtime_ns,"clock":"Instant-relative-monotonic; realtime anchor approximate only","span_cpu":"unsampled; phase cpu_missing counts intentional absence of per-span CPU coverage","bin_ns":BIN_NS,"phase_names":PHASES,"phase_fields":["count","wall_ns","thread_cpu_ns","cpu_covered_wall_ns","cpu_missing","cpu_invalid","max_wall_ns"],"socket_fields":["before_ns","after_ns","SO_MEMINFO_u32"],"socket_memory_fields":["rmem_alloc","rcvbuf","wmem_alloc","sndbuf","fwd_alloc","wmem_queued","optmem","backlog","drops"],"long_fields":["phase","start_ns","end_ns","start_cpu_ns","end_cpu_ns"],"long_omitted":self.omitted,"cutoff_spans":self.cutoff_spans,"monotonic_anchor":self.monotonic_anchor,"final_socket":self.final_socket.map(|s|serde_json::json!([s.before,s.after,s.memory])),"socket_errors":self.socket_errors,"bins":bins,"long_spans":longs,"limits":"complete means timer reached, not full coverage. Partial exit can omit terminal in-flight phase/counters. Completion bins are not utilization bins. Delivered receive timing only; no kernel arrivals or scheduler trace. Socket drops are interval brackets; memory is not payload bytes. Non-CPU elapsed is not runqueue or blocking attribution."});
             value["cpu_sampling"] = serde_json::json!({"policy":"one bracketed thread-CPU snapshot at the first worker opportunity per 100-ms bin, plus final snapshot","fields":["before_ns","thread_cpu_ns","after_ns"],"errors":self.cpu_sample_errors,"final":self.final_cpu_sample.map(|s|serde_json::json!([s.before,s.cpu,s.after])),"limits":"Worker-wide snapshot differences include receive, inline work, housekeeping and diagnostics. No per-span CPU or blocking/preemption/runqueue attribution; delayed worker means delayed snapshots."});
             value["media_coverage"] = serde_json::json!({"timer_origin":"worker_setup","first_authenticated_ns":self.first_authenticated_ns,"last_authenticated_ns":self.last_authenticated_ns,"first_assembled_ns":self.first_assembled_ns,"last_assembled_ns":self.last_assembled_ns,"limits":"Processing-completion endpoints only, not continuous media/decode/presentation or verified scene coverage. Startup is included; scene validation after timer start does not earn 180 seconds of valid scene."});
@@ -553,8 +544,8 @@ fn thread_cpu() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn stamp(wall: u64, cpu: Option<u64>) -> Stamp {
-        Stamp { wall, cpu }
+    fn stamp(wall: u64) -> Stamp {
+        Stamp { wall }
     }
     #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
     #[test]
@@ -631,6 +622,10 @@ mod tests {
         };
         assert_eq!(value["complete"], false);
         assert_eq!(value["socket_errors"], 0);
+        assert_eq!(
+            value["bins"][(end.wall / BIN_NS) as usize]["phases"][Phase::Process as usize],
+            serde_json::json!([1, end.wall - start.wall, 0, 0, 1, 0, end.wall - start.wall])
+        );
         let latest_bin = &value["bins"][latest_index];
         assert_eq!(latest_bin["index"], latest_index);
         assert_eq!(
@@ -659,20 +654,23 @@ mod tests {
     fn cross_bin_spans_missing_cpu_and_bounded_tails_are_explicit() {
         let mut capture = Capture::new();
         for _ in 0..LONG_CAP + 3 {
-            capture.span(
-                Phase::Process,
-                stamp(BIN_NS - 1, Some(0)),
-                stamp(BIN_NS + LONG_NS, Some(10)),
-            );
+            capture.span(Phase::Process, stamp(BIN_NS - 1), stamp(BIN_NS + LONG_NS));
         }
         assert_eq!(capture.bins[0].phases[2].count, 0);
         assert_eq!(capture.bins[1].phases[2].count, (LONG_CAP + 3) as u64);
         assert_eq!(capture.longs.len(), LONG_CAP);
         assert_eq!(capture.omitted, 3);
-        #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
         assert_eq!(
-            capture.bins[1].phases[2].cpu_covered_wall,
-            (LONG_CAP as u64 + 3) * (LONG_NS + 1)
+            capture.bins[1].phases[2].fields(),
+            [
+                (LONG_CAP + 3) as u64,
+                (LONG_CAP as u64 + 3) * (LONG_NS + 1),
+                0,
+                0,
+                (LONG_CAP + 3) as u64,
+                0,
+                LONG_NS + 1
+            ]
         );
         println!(
             "portable_preallocated_bytes={}",
@@ -680,15 +678,17 @@ mod tests {
                 + BIN_COUNT * std::mem::size_of::<Bin>()
                 + LONG_CAP * std::mem::size_of::<LongSpan>()
         );
-        capture.span(Phase::Forward, stamp(0, None), stamp(10, None));
-        capture.span(Phase::Forward, stamp(0, Some(0)), stamp(10, Some(20)));
-        assert_eq!(capture.bins[0].phases[3].cpu_missing, 1);
-        assert_eq!(capture.bins[0].phases[3].cpu_invalid, 1);
+        let boundary = capture.origin + std::time::Duration::from_nanos(137);
+        let reused = capture.stamp_at(boundary);
+        assert_eq!(reused.wall, 137);
+        capture.span(Phase::Forward, stamp(0), stamp(10));
         capture.span(
-            Phase::Process,
-            stamp(0, None),
-            stamp(BIN_NS * BIN_COUNT as u64, None),
+            Phase::Forward,
+            reused,
+            capture.stamp_at(boundary + std::time::Duration::from_nanos(50)),
         );
+        assert_eq!(capture.bins[0].phases[3].fields(), [2, 60, 0, 0, 2, 0, 50]);
+        capture.span(Phase::Process, stamp(0), stamp(BIN_NS * BIN_COUNT as u64));
         assert_eq!(capture.used, 2);
     }
     #[test]
@@ -697,35 +697,27 @@ mod tests {
         let wait_ns = 10_000_000;
         for i in 0..LONG_CAP + 32 {
             let start = i as u64 * wait_ns;
-            capture.span(
-                Phase::Receive,
-                stamp(start, Some(0)),
-                stamp(start + wait_ns, Some(1_000)),
-            );
+            capture.span(Phase::Receive, stamp(start), stamp(start + wait_ns));
         }
         let start = (LONG_CAP + 32) as u64 * wait_ns;
-        capture.span(
-            Phase::Receive,
-            stamp(start, None),
-            stamp(start + wait_ns, None),
-        );
+        capture.span(Phase::Receive, stamp(start), stamp(start + wait_ns));
         capture.span(
             Phase::Process,
-            stamp(start + wait_ns, None),
-            stamp(start + 2 * wait_ns, None),
+            stamp(start + wait_ns),
+            stamp(start + 2 * wait_ns),
         );
         capture.span(
             Phase::Forward,
-            stamp(start + 2 * wait_ns, None),
-            stamp(start + 3 * wait_ns, None),
+            stamp(start + 2 * wait_ns),
+            stamp(start + 3 * wait_ns),
         );
         let receive_count: u64 = capture.bins.iter().map(|b| b.phases[0].count).sum();
-        let receive_cpu: u64 = capture.bins.iter().map(|b| b.phases[0].cpu).sum();
-        let receive_missing: u64 = capture.bins.iter().map(|b| b.phases[0].cpu_missing).sum();
+        let receive_cpu: u64 = capture.bins.iter().map(|b| b.phases[0].fields()[2]).sum();
+        let receive_missing: u64 = capture.bins.iter().map(|b| b.phases[0].fields()[4]).sum();
         let receive_max = capture.bins.iter().map(|b| b.phases[0].max).max().unwrap();
         assert_eq!(receive_count, LONG_CAP as u64 + 33);
-        assert_eq!(receive_cpu, (LONG_CAP as u64 + 32) * 1_000);
-        assert_eq!(receive_missing, 1);
+        assert_eq!(receive_cpu, 0);
+        assert_eq!(receive_missing, receive_count);
         assert_eq!(receive_max, wait_ns);
         assert_eq!(capture.longs.len(), 2);
         assert_eq!(capture.longs[0].phase, Phase::Process as usize);
@@ -737,15 +729,15 @@ mod tests {
     #[test]
     fn raw_accepted_frames_and_counter_resets_remain_distinct() {
         let mut capture = Capture::new();
-        let end = stamp(1, None);
+        let end = stamp(1);
         capture.result(end, Some(1200), false);
         capture.result(end, Some(48), false);
         capture.result(end, None, true);
         capture.result(end, None, false);
         capture.counters(end, [1, 0, 0, 1, 0, 0]);
-        capture.counters(stamp(10, None), [2, 1, 1, 1, 0, 0]);
-        capture.counters(stamp(20, None), [2, 1, 1, 1, 0, 0]);
-        capture.counters(stamp(30, None), [0; 6]);
+        capture.counters(stamp(10), [2, 1, 1, 1, 0, 0]);
+        capture.counters(stamp(20), [2, 1, 1, 1, 0, 0]);
+        capture.counters(stamp(30), [0; 6]);
         let bin = &capture.bins[0];
         assert_eq!((bin.raw, bin.bytes, bin.idle, bin.errors), (2, 1248, 1, 1));
         assert_eq!(

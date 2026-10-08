@@ -7576,27 +7576,20 @@ fn run_nvst_udp_receiver(
                         StunDatagram::NotStun => non_stun += 1,
                     }
                 }
-                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
-                let process_start = diagnostic.as_mut().map(|d| {
-                    did_process = true;
-                    let start = d.stamp();
-                    d.span(
-                        receive_diagnostics::Phase::Preprocess,
-                        receive_end.unwrap(),
-                        start,
-                    );
-                    start
-                });
                 let received_at = Instant::now();
                 let events = receiver.process_datagram(source, &datagram[..length], received_at);
                 #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
                 let process_end = diagnostic.as_mut().map(|d| {
                     let end = d.stamp();
+                    // Reuse the existing protocol timestamp at the exact process-call boundary.
+                    let start = d.stamp_at(received_at);
+                    did_process = true;
                     d.span(
-                        receive_diagnostics::Phase::Process,
-                        process_start.unwrap(),
-                        end,
+                        receive_diagnostics::Phase::Preprocess,
+                        receive_end.unwrap(),
+                        start,
                     );
+                    d.span(receive_diagnostics::Phase::Process, start, end);
                     end
                 });
                 if !authenticated_before {

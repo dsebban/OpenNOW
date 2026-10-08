@@ -283,18 +283,23 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
             let returned = d.stamp();
             d.span(Phase::Receive, entered, returned);
             d.result(returned, Some(packet.datagram.len()), false);
-            let start = d.stamp();
-            d.span(Phase::Preprocess, returned, start);
-            (returned, start)
+            returned
         });
         let start = Instant::now();
         let received = receiver.process_datagram(packet.source, &packet.datagram, now);
         let processed = Instant::now();
         let hook_processed = diagnostic.as_mut().map(|d| {
             let end = d.stamp();
+            // Runtime also has this exact pre-process timestamp; end stamps remain added cost.
+            let process_start = d.stamp_at(start);
+            d.span(
+                super::super::receive_diagnostics::Phase::Preprocess,
+                hook_start.unwrap(),
+                process_start,
+            );
             d.span(
                 super::super::receive_diagnostics::Phase::Process,
-                hook_start.unwrap().1,
+                process_start,
                 end,
             );
             end
@@ -311,7 +316,7 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
             use super::super::receive_diagnostics::Phase;
             let end = d.stamp();
             d.span(Phase::Forward, hook_processed.unwrap(), end);
-            d.span(Phase::Service, hook_start.unwrap().0, end);
+            d.span(Phase::Service, hook_start.unwrap(), end);
             d.counters(
                 end,
                 [
