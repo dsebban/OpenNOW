@@ -737,21 +737,99 @@ enum Control {
 
 pub struct ActiveNvstRtspSession {
     control: Sender<Control>,
-    worker: Option<JoinHandle<String>>,
+    worker: Option<JoinHandle<ControlExit>>,
 }
 
-/// Bounded, single-line excerpt of server-supplied text for diagnostics.
-fn printable_excerpt(text: &str, limit: usize) -> String {
-    text.chars()
-        .take(limit)
-        .map(|character| {
-            if character.is_ascii_graphic() || character == ' ' {
-                character
-            } else {
-                '?'
+// Only locally authored categories, typed I/O kinds and numeric protocol/counter
+// data can reach persistent control diagnostics. Peer/error text cannot.
+#[derive(Debug, PartialEq, Eq)]
+struct ControlFailure {
+    category: ControlFailureCategory,
+    io_kind: Option<ErrorKind>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ControlFailureCategory {
+    Io,
+    ConnectionClosed,
+    AlreadyClosed,
+    Tls,
+    Capacity,
+    Protocol,
+    WriteBufferFull,
+    Utf8,
+    AttackAttempt,
+    Url,
+    Http,
+    HttpFormat,
+}
+
+impl ControlFailure {
+    fn from_error(error: &tungstenite::Error) -> Self {
+        use ControlFailureCategory as Category;
+        use tungstenite::Error;
+        let category = match error {
+            Error::Io(error) => {
+                return Self {
+                    category: Category::Io,
+                    io_kind: Some(error.kind()),
+                };
             }
-        })
-        .collect()
+            Error::ConnectionClosed => Category::ConnectionClosed,
+            Error::AlreadyClosed => Category::AlreadyClosed,
+            Error::Tls(_) => Category::Tls,
+            Error::Capacity(_) => Category::Capacity,
+            Error::Protocol(_) => Category::Protocol,
+            Error::WriteBufferFull(_) => Category::WriteBufferFull,
+            Error::Utf8(_) => Category::Utf8,
+            Error::AttackAttempt => Category::AttackAttempt,
+            Error::Url(_) => Category::Url,
+            Error::Http(_) => Category::Http,
+            Error::HttpFormat(_) => Category::HttpFormat,
+        };
+        Self {
+            category,
+            io_kind: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ControlFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Debug is safe only for these payload-free local enums / std I/O kinds,
+        // never for tungstenite::Error or any peer-supplied payload.
+        write!(
+            f,
+            "error_category={:?} io_kind={:?}",
+            self.category, self.io_kind
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ControlExit {
+    LocalShutdown,
+    PingSendFailed(ControlFailure),
+    PongSendFailed(ControlFailure),
+    ServerClose(Option<u16>),
+    ReadFailed(ControlFailure),
+    BufferOverflow(usize),
+    UnparseableServerMessage,
+}
+
+impl std::fmt::Display for ControlExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalShutdown => f.write_str("local-shutdown"),
+            Self::PingSendFailed(failure) => write!(f, "ping-send-failed {failure}"),
+            Self::PongSendFailed(failure) => write!(f, "pong-send-failed {failure}"),
+            Self::ServerClose(Some(code)) => write!(f, "server-close code={code}"),
+            Self::ServerClose(None) => f.write_str("server-close code=none"),
+            Self::ReadFailed(failure) => write!(f, "read-failed {failure}"),
+            Self::BufferOverflow(bytes) => write!(f, "buffer-overflow bytes={bytes}"),
+            Self::UnparseableServerMessage => f.write_str("unparseable-server-message"),
+        }
+    }
 }
 
 impl ActiveNvstRtspSession {
@@ -779,7 +857,7 @@ impl ActiveNvstRtspSession {
                     if receiver.try_recv().is_ok() {
                         control_ping.clear();
                         let _ = client.socket.close(None);
-                        break "local-shutdown".to_owned();
+                        break ControlExit::LocalShutdown;
                     }
                     let now = Instant::now();
                     if outstanding.is_some_and(|(_, sent_at)| {
@@ -808,7 +886,7 @@ impl ActiveNvstRtspSession {
                             .socket
                             .send(Message::Ping(ping_sequence.to_be_bytes().to_vec().into()))
                         {
-                            break format!("ping-send-failed error={error}");
+                            break ControlExit::PingSendFailed(ControlFailure::from_error(&error));
                         }
                         outstanding = Some((ping_sequence, now));
                         last_ping = now;
@@ -824,7 +902,7 @@ impl ActiveNvstRtspSession {
                         }
                         Ok(Message::Ping(bytes)) => {
                             if let Err(error) = client.socket.send(Message::Pong(bytes)) {
-                                break format!("pong-send-failed error={error}");
+                                break ControlExit::PongSendFailed(ControlFailure::from_error(&error));
                             }
                         }
                         Ok(Message::Pong(bytes)) => {
@@ -848,14 +926,7 @@ impl ActiveNvstRtspSession {
                             }
                         }
                         Ok(Message::Close(frame)) => {
-                            break match frame {
-                                Some(frame) => format!(
-                                    "server-close code={} reason={:?}",
-                                    u16::from(frame.code),
-                                    printable_excerpt(frame.reason.as_str(), 160)
-                                ),
-                                None => "server-close code=none".to_owned(),
-                            };
+                            break ControlExit::ServerClose(frame.map(|frame| u16::from(frame.code)));
                         }
                         Ok(_) => {}
                         Err(tungstenite::Error::Io(error))
@@ -863,25 +934,20 @@ impl ActiveNvstRtspSession {
                                 error.kind(),
                                 ErrorKind::WouldBlock | ErrorKind::TimedOut
                             ) => {}
-                        Err(error) => break format!("read-failed error={error}"),
+                        Err(error) => break ControlExit::ReadFailed(ControlFailure::from_error(&error)),
                     }
                     if client.buffer.len() > MAX_CONTROL_RESPONSE_BYTES {
-                        break format!("buffer-overflow bytes={}", client.buffer.len());
+                        break ControlExit::BufferOverflow(client.buffer.len());
                     }
                     let mut parse_failure = None;
                     while !client.buffer.is_empty() {
-                        let head = printable_excerpt(
-                            client.buffer.lines().next().unwrap_or_default(),
-                            160,
-                        );
                         match take_rtsp_response(&mut client.buffer, client.cseq) {
                             Ok(Some(response)) => opennow_streamer_protocol::log::log_line(
                                 "INFO",
                                 "rtsps",
                                 &format!(
-                                    "control_response status={} text={:?}",
-                                    response.status,
-                                    printable_excerpt(&response.status_text, 80)
+                                    "control_response status={}",
+                                    response.status
                                 ),
                             ),
                             Ok(None) => break,
@@ -889,14 +955,11 @@ impl ActiveNvstRtspSession {
                                 opennow_streamer_protocol::log::log_line(
                                     "WARN",
                                     "rtsps",
-                                    &format!("control_unsolicited head={head:?} {}", error.message),
+                                    "control_unsolicited category=sequence-mismatch",
                                 );
                             }
-                            Err(error) => {
-                                parse_failure = Some(format!(
-                                    "unparseable-server-message head={head:?} error={}",
-                                    error.message
-                                ));
+                            Err(_) => {
+                                parse_failure = Some(ControlExit::UnparseableServerMessage);
                                 break;
                             }
                         }
@@ -908,7 +971,7 @@ impl ActiveNvstRtspSession {
                 control_ping.clear();
                 let ended = Instant::now();
                 opennow_streamer_protocol::log::log_line(
-                    if reason == "local-shutdown" { "INFO" } else { "WARN" },
+                    if reason == ControlExit::LocalShutdown { "INFO" } else { "WARN" },
                     "rtsps",
                     &format!(
                         "control_exit reason={reason} uptime_ms={} pings_sent={ping_sequence} pongs={pongs} missed_pongs={missed} last_inbound_ms_ago={}",

@@ -1780,6 +1780,7 @@ dependencies = [
  "getrandom 0.3.4",
  "ghash",
  "hmac",
+ "libc",
  "mtu",
  "opennow-streamer-hid",
  "opennow-streamer-protocol",

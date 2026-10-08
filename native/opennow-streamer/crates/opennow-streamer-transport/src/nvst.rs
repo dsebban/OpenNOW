@@ -7363,6 +7363,10 @@ fn run_nvst_webrtc_bundle(
     }
 }
 
+#[cfg(any(test, all(feature = "receive-diagnostics", target_os = "linux")))]
+#[path = "nvst/receive_diagnostics.rs"]
+mod receive_diagnostics;
+
 fn run_nvst_udp_receiver(
     socket: UdpSocket,
     config: NvstVideoConfig,
@@ -7406,6 +7410,8 @@ fn run_nvst_udp_receiver(
     let stats_origin = Instant::now();
     let mut last_stats_log = Instant::now();
     let mut reported_port_unreachable = false;
+    #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+    let mut diagnostic = receive_diagnostics::Capture::start();
     loop {
         loop {
             match commands.try_recv() {
@@ -7482,7 +7488,36 @@ fn run_nvst_udp_receiver(
             last_ping = now;
         }
 
-        match socket.recv_from(&mut datagram) {
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        receive_diagnostics::Capture::checkpoint(&mut diagnostic, &socket);
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        let receive_start = diagnostic.as_mut().map(|d| d.before_receive());
+        let receive_result = socket.recv_from(&mut datagram);
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        let receive_end = diagnostic.as_mut().map(|d| {
+            let end = d.stamp();
+            d.span(
+                receive_diagnostics::Phase::Receive,
+                receive_start.unwrap(),
+                end,
+            );
+            d.result(
+                end,
+                receive_result.as_ref().ok().map(|(length, _)| *length),
+                receive_result
+                    .as_ref()
+                    .err()
+                    .is_some_and(udp_receive_is_idle),
+            );
+            end
+        });
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        let mut did_process = false;
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        let mut forward_finished = None;
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        let received_datagram = receive_result.is_ok();
+        match receive_result {
             Ok((length, source)) => 'datagram: {
                 inbound_datagrams += 1;
                 if inbound_datagrams == 1 {
@@ -7541,8 +7576,29 @@ fn run_nvst_udp_receiver(
                         StunDatagram::NotStun => non_stun += 1,
                     }
                 }
+                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                let process_start = diagnostic.as_mut().map(|d| {
+                    did_process = true;
+                    let start = d.stamp();
+                    d.span(
+                        receive_diagnostics::Phase::Preprocess,
+                        receive_end.unwrap(),
+                        start,
+                    );
+                    start
+                });
                 let received_at = Instant::now();
                 let events = receiver.process_datagram(source, &datagram[..length], received_at);
+                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                let process_end = diagnostic.as_mut().map(|d| {
+                    let end = d.stamp();
+                    d.span(
+                        receive_diagnostics::Phase::Process,
+                        process_start.unwrap(),
+                        end,
+                    );
+                    end
+                });
                 if !authenticated_before {
                     feedback.record_socket_receive(
                         StreamSocket::Video,
@@ -7561,9 +7617,33 @@ fn run_nvst_udp_receiver(
                         &mut video_delivery_gap,
                         event,
                     ) {
+                        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                        if let Some(d) = diagnostic.as_mut() {
+                            let end = d.stamp();
+                            d.span(
+                                receive_diagnostics::Phase::Forward,
+                                process_end.unwrap(),
+                                end,
+                            );
+                            d.span(
+                                receive_diagnostics::Phase::Service,
+                                receive_end.unwrap(),
+                                end,
+                            );
+                        }
                         forward_optional(&event_sender, receiver.stop());
                         return;
                     }
+                }
+                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                if let Some(d) = diagnostic.as_mut() {
+                    let end = d.stamp();
+                    d.span(
+                        receive_diagnostics::Phase::Forward,
+                        process_end.unwrap(),
+                        end,
+                    );
+                    forward_finished = Some(end);
                 }
             }
             Err(error) if udp_receive_is_idle(&error) => {
@@ -7580,6 +7660,36 @@ fn run_nvst_udp_receiver(
                 forward_optional(&event_sender, receiver.stop());
                 return;
             }
+        }
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if let Some(d) = diagnostic.as_mut() {
+            let end = forward_finished.unwrap_or_else(|| d.stamp());
+            if received_datagram {
+                if !did_process {
+                    d.span(
+                        receive_diagnostics::Phase::Preprocess,
+                        receive_end.unwrap(),
+                        end,
+                    );
+                }
+                d.span(
+                    receive_diagnostics::Phase::Service,
+                    receive_end.unwrap(),
+                    end,
+                );
+            }
+            d.counters(
+                end,
+                [
+                    receiver.authenticated_packets,
+                    receiver.frames_emitted,
+                    receiver.fec_repaired_packets,
+                    handled_stun,
+                    invalid_stun,
+                    wrong_source,
+                ],
+            );
+            d.service_end(end);
         }
         let now = Instant::now();
         if let Some(report) = receiver.poll_receiver_report(now) {
@@ -7855,6 +7965,11 @@ mod tests {
 
     mod audio_tests {
         include!("nvst_audio_tests.rs");
+    }
+
+    #[cfg(test)]
+    mod receive_replay_tests {
+        include!("nvst/receive_replay_tests.rs");
     }
 
     mod ping_tests {

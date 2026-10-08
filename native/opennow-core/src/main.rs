@@ -206,7 +206,7 @@ fn run() -> Result<(), String> {
                 &method,
                 format!("outcome={outcome} durationMs={}", started.elapsed().as_millis()),
             );
-            record_session_outcome(&worker_core, &method, &result);
+            record_session_outcome(&worker_core.diagnostics, &worker_core.last_session_state, &method, &result);
             let was_cancelled = permit.token.cancelled();
             if method == "session.create"
                 && let Err((code, message)) = &result
@@ -271,31 +271,29 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// Persist session lifecycle transitions and failure text; the RPC line above keeps only the code.
-fn record_session_outcome(core: &AppCore, method: &str, result: &DispatchResult) {
+/// Persist owned lifecycle transitions and RPC error codes, never untrusted failure text.
+fn record_session_outcome(
+    diagnostics: &diagnostics::DiagnosticsService,
+    last_session_state: &Mutex<String>,
+    method: &str,
+    result: &DispatchResult,
+) {
     if !method.starts_with("session.") {
         return;
     }
     match result {
-        Err((code, message)) => core.diagnostics.record(
+        Err((code, _)) => diagnostics.record(
             "session",
             "rpc-error",
-            format!(
-                "method={method} code={code} message={}",
-                diagnostics::runtime_failure_reason(message)
-            ),
+            format!("method={method} code={code}"),
         ),
         // Remote listings are not the owned session's lifecycle.
         Ok(_) if method == "session.remote.list" => {}
         Ok((value, _)) => {
             let evidence = diagnostics::session_state_evidence(value);
-            let mut last = core
-                .last_session_state
-                .lock()
-                .expect("session state poisoned");
+            let mut last = last_session_state.lock().expect("session state poisoned");
             if *last != evidence {
-                core.diagnostics
-                    .record("session", "state", format!("method={method} {evidence}"));
+                diagnostics.record("session", "state", format!("method={method} {evidence}"));
                 *last = evidence;
             }
         }
@@ -1237,6 +1235,72 @@ fn argument_value(name: &str) -> Option<String> {
 #[cfg(test)]
 mod acceptance_tests {
     use super::*;
+
+    #[test]
+    fn session_outcome_omits_peer_error_text_and_preserves_lifecycle() {
+        let path = std::env::temp_dir().join(format!(
+            "opennow-session-privacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let diagnostics = diagnostics::DiagnosticsService::new(&path).unwrap();
+        let state = Mutex::new(String::new());
+        let result: DispatchResult = Err((
+            "session_discovery_failed".into(),
+            "peer-private-session-id close-text-untrusted".into(),
+        ));
+        record_session_outcome(&diagnostics, &state, "session.remote.list", &result);
+        assert_eq!(
+            result.as_ref().unwrap_err().1,
+            "peer-private-session-id close-text-untrusted",
+            "logging must not alter the actual RPC error"
+        );
+        let remote = Ok((
+            json!({"session":{"status":99,"phase":"remote-private-id"}}),
+            None,
+        ));
+        record_session_outcome(&diagnostics, &state, "session.remote.list", &remote);
+        assert!(
+            state.lock().unwrap().is_empty(),
+            "remote listings must not replace owned lifecycle state"
+        );
+        let owned = Ok((
+            json!({"session":{"status":7,"phase":"finished","termination":{"status":8,"source":"server","resumable":true}}}),
+            None,
+        ));
+        record_session_outcome(&diagnostics, &state, "session.status", &owned);
+        record_session_outcome(&diagnostics, &state, "session.status", &owned);
+        let evidence = std::fs::read_to_string(path.join("diagnostics/current.log")).unwrap();
+        assert!(evidence.contains("method=session.remote.list code=session_discovery_failed"));
+        for excluded in [
+            "peer-private-session-id",
+            "close-text-untrusted",
+            "remote-private-id",
+            "message=",
+        ] {
+            assert!(
+                !evidence.contains(excluded),
+                "untrusted text retained: {excluded}"
+            );
+        }
+        assert_eq!(
+            evidence
+                .lines()
+                .filter(|line| line.contains("state"))
+                .count(),
+            1,
+            "identical lifecycle updates must remain deduplicated"
+        );
+        assert!(
+            evidence.contains("method=session.status")
+                && evidence.contains("finished")
+                && evidence.contains("resumable")
+        );
+        println!("session_privacy_fixture={}", path.display());
+    }
 
     #[test]
     fn updates_require_no_session_and_a_terminal_streamer() {

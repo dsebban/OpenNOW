@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+receive-diagnostics = ["opennow-streamer-transport/receive-diagnostics"]
+
 [dependencies]
 base64.workspace = true
 getrandom.workspace = true

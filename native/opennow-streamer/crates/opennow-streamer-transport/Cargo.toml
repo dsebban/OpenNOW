@@ -34,11 +34,15 @@ str0m = { workspace = true, features = ["rust-crypto"] }
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 str0m = { workspace = true, features = ["rust-crypto"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
+
 [dev-dependencies]
 serde_json.workspace = true
 
 [features]
 sony-peer-probe = []
+receive-diagnostics = ["dep:libc"]
 
 [[bin]]
 name = "nvst-peer-probe"

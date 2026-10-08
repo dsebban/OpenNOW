@@ -220,6 +220,28 @@ set(OPENNOW_STREAMER_FFI_LINK_LIBRARY
 set(OPENNOW_STREAMER_FFI_ARTIFACTS
     "${OPENNOW_STREAMER_FFI_RUNTIME}" "${OPENNOW_STREAMER_FFI_LINK_LIBRARY}")
 list(REMOVE_DUPLICATES OPENNOW_STREAMER_FFI_ARTIFACTS)
+# The research wrapper accepts no feature CLI flags but preserves its environment.
+# An explicit ON/OFF environment value updates this same developer cache option.
+if(DEFINED ENV{OPENNOW_DEVELOPER_RECEIVE_DIAGNOSTICS})
+    if(NOT "$ENV{OPENNOW_DEVELOPER_RECEIVE_DIAGNOSTICS}" MATCHES "^(ON|OFF)$")
+        message(FATAL_ERROR "OPENNOW_DEVELOPER_RECEIVE_DIAGNOSTICS must be ON or OFF")
+    endif()
+    set(OPENNOW_DEVELOPER_RECEIVE_DIAGNOSTICS
+        "$ENV{OPENNOW_DEVELOPER_RECEIVE_DIAGNOSTICS}" CACHE BOOL
+        "Build Linux-only bounded receive diagnostics (runtime opt-in still required)" FORCE)
+endif()
+option(OPENNOW_DEVELOPER_RECEIVE_DIAGNOSTICS
+    "Build Linux-only bounded receive diagnostics (runtime opt-in still required)" OFF)
+if(OPENNOW_DEVELOPER_RECEIVE_DIAGNOSTICS AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "Receive diagnostics require a Linux target")
+endif()
+set(OPENNOW_STREAMER_FFI_FEATURE_ARGS ${OPENNOW_STREAMER_CARGO_FEATURE_ARGS})
+if(OPENNOW_DEVELOPER_RECEIVE_DIAGNOSTICS)
+    list(APPEND OPENNOW_STREAMER_FFI_FEATURE_ARGS --features receive-diagnostics)
+endif()
+# Make cache-option changes invalidate the output with both Ninja and Make.
+file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/streamer-ffi-features.txt"
+    CONTENT "${OPENNOW_STREAMER_FFI_FEATURE_ARGS}\n" @ONLY)
 set(OPENNOW_STREAMER_FFI_CARGO_COMMAND build)
 set(OPENNOW_STREAMER_FFI_RUSTC_ARGS)
 if(APPLE)
@@ -239,10 +261,11 @@ add_custom_command(
             --package opennow-streamer-ffi
             --lib
             ${OPENNOW_RUST_TARGET_ARGS}
-            ${OPENNOW_STREAMER_CARGO_FEATURE_ARGS}
+            ${OPENNOW_STREAMER_FFI_FEATURE_ARGS}
             --release
             ${OPENNOW_STREAMER_FFI_RUSTC_ARGS}
     DEPENDS
+        "${CMAKE_BINARY_DIR}/streamer-ffi-features.txt"
         "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.lock"
         "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.toml"
         "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/crates/opennow-streamer-ffi/include/opennow_streamer_ffi.h"
@@ -253,7 +276,13 @@ add_custom_command(
     VERBATIM
 )
 add_custom_target(opennow-streamer-ffi-build
-    DEPENDS ${OPENNOW_STREAMER_FFI_ARTIFACTS})
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:opennow-qt>"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${OPENNOW_STREAMER_FFI_RUNTIME}"
+            "$<TARGET_FILE_DIR:opennow-qt>/${OPENNOW_STREAMER_FFI_RUNTIME_NAME}"
+    DEPENDS ${OPENNOW_STREAMER_FFI_ARTIFACTS}
+    COMMENT "Building and deploying the embedded OpenNOW streamer runtime"
+    VERBATIM)
 
 set(OPENNOW_STREAMER_PEER_PROBE_NAME "nvst-peer-probe")
 set(OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR "${CMAKE_BINARY_DIR}/peer-probe-rust-target")
@@ -342,21 +371,10 @@ set_target_properties(opennow-streamer-ffi PROPERTIES
 add_dependencies(opennow-streamer-ffi opennow-streamer-ffi-build)
 target_link_libraries(opennow-qt PRIVATE opennow-streamer-ffi)
 add_dependencies(opennow-qt opennow-streamer-ffi-build)
-add_custom_command(TARGET opennow-qt POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${OPENNOW_STREAMER_FFI_RUNTIME}"
-            "$<TARGET_FILE_DIR:opennow-qt>/${OPENNOW_STREAMER_FFI_RUNTIME_NAME}"
-    VERBATIM)
-# POST_BUILD only runs when the C++ executable itself relinks. Rust-only edits rebuild the FFI
-# artifact without relinking OpenNOW, which previously left a stale streamer DLL beside the app.
-# Keep the post-build hook for target-specific builds and add an always-considered deployment
-# target for normal/default builds; copy_if_different makes the up-to-date case inexpensive.
-add_custom_target(opennow-streamer-ffi-deploy ALL
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${OPENNOW_STREAMER_FFI_RUNTIME}"
-            "$<TARGET_FILE_DIR:opennow-qt>/${OPENNOW_STREAMER_FFI_RUNTIME_NAME}"
-    COMMENT "Deploying the embedded OpenNOW streamer runtime"
-    VERBATIM)
+# Deployment belongs to ffi-build, which opennow-qt depends on. This also runs
+# for the target-specific research builder when Rust changes without a Qt relink.
+# Preserve the existing deployment target for callers of the default build.
+add_custom_target(opennow-streamer-ffi-deploy ALL)
 add_dependencies(opennow-streamer-ffi-deploy opennow-streamer-ffi-build opennow-qt)
 if(APPLE)
     set_property(TARGET opennow-qt APPEND PROPERTY BUILD_RPATH "@loader_path")
