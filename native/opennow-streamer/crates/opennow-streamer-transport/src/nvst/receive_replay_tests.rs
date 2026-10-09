@@ -52,6 +52,7 @@ struct PacketCost {
     forward_ns: u64,
     service_ns: u64,
     bracketed_ns: u64,
+    inner_split_selected: bool,
     authenticated_delta: u64,
     frames_forwarded: u64,
     repaired_delta: u64,
@@ -245,6 +246,7 @@ fn receive_diagnostic_hook_cost_report() {
             json!({
                 "pair": pair + 1, "instrumented_first":instrumented_first,
                 "packets_per_pass":ordinary.len(), "frames_per_pass":600,
+                "selected_packets_measured":instrumented.iter().filter(|c|c.inner_split_selected).count(),"inner_stride":16,
                 "ordinary_total_ns":ordinary_total,"instrumented_total_ns":instrumented_total,
                 "total_increase_percent":100.0 * (instrumented_total as f64 / ordinary_total as f64 - 1.0),
                 "ordinary_bracketed_ns":ordinary_bracketed,"instrumented_bracketed_ns":instrumented_bracketed,
@@ -255,7 +257,7 @@ fn receive_diagnostic_hook_cost_report() {
                 "ordinary_service":distribution(ordinary.iter().map(|c|c.service_ns)),
                 "instrumented_service":distribution(instrumented.iter().map(|c|c.service_ns)),
             "linux_bin_cpu_and_socket_hooks":cfg!(all(target_os="linux",feature="receive-diagnostics")),
-            "limits":"H2 schema2 full-coverage hook cost only; no recv syscall, exporter or live scheduling. Both modes include common loop-top/process/processed/finished/bracket-end reads; Linux exercises actual per-bin CPU and SO_MEMINFO on idle loopback. Wall-only phases; CPU snapshots do not assign per-span cause. Clock dominance unproved. Passing admits one capture, not a gain or historical FAIL rescore."
+            "limits":"H3 schema3 fixed1/16-inner/full-outer hook cost only; no recv syscall, exporter or live scheduling. Both modes include common loop-top/process/processed/finished/bracket-end reads; Linux exercises actual per-bin CPU and SO_MEMINFO on idle loopback. Unsampled inner phases not localized or extrapolated; wall-only phases; CPU snapshots do not assign per-span cause. Clock dominance unproved. Passing admits one capture, not a gain or historical FAIL rescore."
             })
         );
     }
@@ -268,11 +270,11 @@ fn receive_diagnostic_hook_cost_report() {
     let legacy = median(legacy_costs);
     println!(
         "RECEIVE_DIAGNOSTIC_ADMISSION {}",
-        json!({"schema":2,"pairs":3,
+        json!({"schema":3,"pairs":3,
         "median_symmetric_increase_percent":cost,"median_symmetric_p99_change_percent":p99,
         "median_asymmetric_legacy_increase_percent":legacy,"cost_threshold_percent":5.0,"p99_threshold_percent":5.0,
         "verdict":if cost <= 5.0 && p99 <= 5.0 { "PASS" } else { "FAIL" },
-        "limits":"Prospective H2 gate only; validity assertions mandatory; no row-bearing retry or historical rescoring."})
+        "limits":"Prospective H3 gate only; validity assertions mandatory; no row-bearing retry or historical rescoring."})
     );
 }
 
@@ -305,7 +307,7 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
     #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
     let diagnostic_socket = diagnostic_hooks.then(|| UdpSocket::bind("127.0.0.1:0").unwrap());
     let mut costs = Vec::with_capacity(fixture.packets.len());
-    for packet in &fixture.packets {
+    for (ordinal, packet) in fixture.packets.iter().enumerate() {
         let now = origin + Duration::from_nanos(packet.arrival_ns);
         let accepted = receiver.authenticated_packets;
         let repaired = receiver.fec_repaired_packets;
@@ -325,12 +327,16 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
             let entered = d.receive_start(loop_top, sampled, false);
             d.receive_returned(entered, Some(packet.datagram.len()), false)
         });
+        let split_selected = diagnostic.as_ref().is_some_and(|_| {
+            super::super::receive_diagnostics::Capture::split_selected(ordinal as u64 + 1)
+        });
         let start = Instant::now();
         let received = receiver.process_datagram(packet.source, &packet.datagram, now);
         let processed = Instant::now();
         let hook_processed = diagnostic
             .as_mut()
-            .map(|d| d.process_returned(hook_start.unwrap(), start));
+            .map(|d| d.process_returned(hook_start.unwrap(), start, split_selected))
+            .unwrap_or(super::super::receive_diagnostics::ProcessTiming::NotCalled);
         let mut forwarded = 0;
         for event in received {
             forwarded += u64::from(matches!(event, NvstReceiveEvent::Frame(_)));
@@ -345,6 +351,7 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
                 hook_start.unwrap(),
                 true,
                 hook_processed,
+                split_selected,
                 [
                     receiver.authenticated_packets,
                     receiver.frames_emitted,
@@ -363,6 +370,7 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
             forward_ns: nanos(finished - processed),
             service_ns: nanos(finished - start), // R1 definition unchanged in both modes.
             bracketed_ns: nanos(bracket_end - loop_top),
+            inner_split_selected: split_selected,
             authenticated_delta: receiver.authenticated_packets - accepted,
             frames_forwarded: forwarded,
             repaired_delta: receiver.fec_repaired_packets - repaired,
@@ -414,6 +422,22 @@ fn replay(fixture: &Fixture, warmup: usize, diagnostic_hooks: bool) -> Vec<Packe
             fixture.packets.len() as u64,
             frame_count as u64,
             fixture.repaired_frames as u64,
+            (fixture.packets.len() as u64)
+                .div_ceil(super::super::receive_diagnostics::SPLIT_STRIDE),
+        );
+        let expected_selected = fixture
+            .packets
+            .iter()
+            .enumerate()
+            .filter(|(i, packet)| packet.frame >= warmup && i.is_multiple_of(16))
+            .count();
+        let actual_selected = costs.iter().filter(|c| c.inner_split_selected).count();
+        assert_eq!(actual_selected, expected_selected);
+        println!(
+            "RECEIVE_DIAGNOSTIC_SELECTED_COVERAGE measured_packets={} measured_selected={} expected_selected={} includes_warmup_policy=true",
+            costs.len(),
+            actual_selected,
+            expected_selected
         );
     }
     costs
@@ -435,6 +459,7 @@ fn traversal(fixture: &Fixture, warmup: usize) -> Vec<PacketCost> {
             forward_ns: nanos(finished - processed),
             service_ns: nanos(finished - start),
             bracketed_ns: nanos(finished - start), // Traversal is not diagnostic admission.
+            inner_split_selected: false,
             authenticated_delta: 0,
             frames_forwarded: 0,
             repaired_delta: 0,

@@ -16,7 +16,8 @@ pub(super) const BIN_NS: u64 = 100_000_000;
 const BIN_COUNT: usize = 1_800;
 const LONG_CAP: usize = 1_024;
 const LONG_NS: u64 = 1_000_000;
-const PHASE_BOUNDARIES: &str = "Receive starts at the existing worker loop-top instant, except ping iterations use a fresh post-ping stamp and sample iterations use the socket-query end. Receive ends immediately after recv_from; Preprocess ends at the original process-call timestamp; Process ends at a fresh post-call stamp. Forward and Service end at the existing post-match instant; Between runs from that completion to the next receive start. Completion excludes diagnostic final bookkeeping; Between includes it. No phase subsampling.";
+pub(super) const SPLIT_STRIDE: u64 = 16;
+const PHASE_BOUNDARIES: &str = "Receive starts at the existing worker loop-top instant, except ping iterations use a fresh post-ping stamp and sample iterations use the socket-query end. Receive ends immediately after recv_from; Preprocess ends at the original process-call timestamp; Process ends at a fresh post-call stamp. Forward and Service end at the existing post-match instant; Between runs from that completion to the next receive start. Completion excludes diagnostic final bookkeeping; Between includes it. Inner phases are fixed-stride successful-receive samples; Receive/Between/Service remain exhaustive.";
 
 #[derive(Clone, Copy)]
 pub(super) enum Phase {
@@ -39,6 +40,14 @@ const PHASES: [&str; 6] = [
 #[derive(Clone, Copy)]
 pub(super) struct Stamp {
     pub wall: u64,
+}
+
+// Process-call state stays explicit even when no inner clock was sampled.
+#[derive(Clone, Copy)]
+pub(super) enum ProcessTiming {
+    NotCalled,
+    Unsampled,
+    Sampled(Stamp),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -76,6 +85,8 @@ struct Bin {
     invalid_stun: u64,
     wrong_source: u64,
     counter_discontinuities: u64,
+    split_sampled_services: u64,
+    processed_services: u64,
     socket: Option<SocketSample>,
     #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
     cpu_sample: Option<CpuSample>,
@@ -97,6 +108,7 @@ struct LongSpan {
     phase: usize,
     start: Stamp,
     end: Stamp,
+    inner_split_selected: Option<bool>,
 }
 
 pub(super) struct Capture {
@@ -177,7 +189,7 @@ impl Capture {
         }
     }
     #[cfg(test)]
-    pub(super) fn assert_fixture(&self, packets: u64, frames: u64, repaired: u64) {
+    pub(super) fn assert_fixture(&self, packets: u64, frames: u64, repaired: u64, selected: u64) {
         let sum = |field: fn(&Bin) -> u64| self.bins.iter().map(field).sum::<u64>();
         assert_eq!(sum(|b| b.raw), packets);
         assert_eq!(sum(|b| b.accepted), packets);
@@ -192,19 +204,24 @@ impl Capture {
                 + b.counter_discontinuities),
             0
         );
-        for phase in [
-            Phase::Receive,
-            Phase::Preprocess,
-            Phase::Process,
-            Phase::Forward,
-            Phase::Service,
-        ] {
+        assert_eq!(sum(|b| b.split_sampled_services), selected);
+        assert_eq!(sum(|b| b.processed_services), packets);
+        for phase in [Phase::Receive, Phase::Service] {
             assert_eq!(
                 self.bins
                     .iter()
                     .map(|b| b.phases[phase as usize].count)
                     .sum::<u64>(),
                 packets
+            );
+        }
+        for phase in [Phase::Preprocess, Phase::Process, Phase::Forward] {
+            assert_eq!(
+                self.bins
+                    .iter()
+                    .map(|b| b.phases[phase as usize].count)
+                    .sum::<u64>(),
+                selected
             );
         }
         assert_eq!(
@@ -243,7 +260,7 @@ impl Capture {
             }
         }
         println!(
-            "RECEIVE_DIAGNOSTIC_FIXTURE_VALIDATION packets={packets} frames={frames} repaired={repaired} used_bins={} tails={} omissions={} cutoff={} sampling_errors={} span_cpu=unsampled",
+            "RECEIVE_DIAGNOSTIC_FIXTURE_VALIDATION packets={packets} frames={frames} repaired={repaired} selected_services={selected} processed_services={packets} used_bins={} tails={} omissions={} cutoff={} sampling_errors={} span_cpu=unsampled",
             self.used,
             self.longs.len(),
             self.omitted,
@@ -279,9 +296,24 @@ impl Capture {
     }
     #[inline]
     pub(super) fn span(&mut self, phase: Phase, start: Stamp, end: Stamp) {
+        self.record_span(phase, start, end, None);
+    }
+    #[inline]
+    fn record_span(
+        &mut self,
+        phase: Phase,
+        start: Stamp,
+        end: Stamp,
+        service: Option<(bool, bool)>,
+    ) {
         let Some(bin) = self.bin(end) else {
             return;
         };
+        // Coverage belongs to the Service completion bin, never the raw-receive bin.
+        if let Some((processed, selected)) = service {
+            bin.processed_services += u64::from(processed);
+            bin.split_sampled_services += u64::from(selected);
+        }
         let phase = phase as usize;
         if bin.phases[phase].add(start, end) >= LONG_NS {
             if phase == Phase::Receive as usize {
@@ -291,7 +323,12 @@ impl Capture {
                 return;
             }
             if self.longs.len() < LONG_CAP {
-                self.longs.push(LongSpan { phase, start, end });
+                self.longs.push(LongSpan {
+                    phase,
+                    start,
+                    end,
+                    inner_split_selected: service.map(|(_, selected)| selected),
+                });
             } else {
                 self.omitted += 1;
             }
@@ -329,12 +366,25 @@ impl Capture {
         end
     }
     #[inline]
-    pub(super) fn process_returned(&mut self, receive_end: Stamp, received_at: Instant) -> Stamp {
+    pub(super) fn split_selected(successful_receive_ordinal: u64) -> bool {
+        successful_receive_ordinal != 0
+            && (successful_receive_ordinal - 1).is_multiple_of(SPLIT_STRIDE)
+    }
+    #[inline]
+    pub(super) fn process_returned(
+        &mut self,
+        receive_end: Stamp,
+        received_at: Instant,
+        selected: bool,
+    ) -> ProcessTiming {
+        if !selected {
+            return ProcessTiming::Unsampled;
+        } // No clock read or inner update.
         let end = self.stamp();
         let start = self.stamp_at(received_at);
         self.span(Phase::Preprocess, receive_end, start);
         self.span(Phase::Process, start, end);
-        end
+        ProcessTiming::Sampled(end)
     }
     #[inline]
     pub(super) fn complete_iteration(
@@ -342,17 +392,27 @@ impl Capture {
         at: Instant,
         receive_end: Stamp,
         received: bool,
-        process_end: Option<Stamp>,
+        process: ProcessTiming,
+        selected: bool,
         counts: [u64; 6],
     ) {
         let end = self.stamp_at(at);
         if received {
-            if let Some(process_end) = process_end {
-                self.span(Phase::Forward, process_end, end);
-            } else {
-                self.span(Phase::Preprocess, receive_end, end);
+            if selected {
+                match process {
+                    ProcessTiming::Sampled(process_end) => {
+                        self.span(Phase::Forward, process_end, end)
+                    }
+                    ProcessTiming::NotCalled => self.span(Phase::Preprocess, receive_end, end),
+                    ProcessTiming::Unsampled => {} // No retroactive localization.
+                }
             }
-            self.span(Phase::Service, receive_end, end);
+            self.record_span(
+                Phase::Service,
+                receive_end,
+                end,
+                Some((!matches!(process, ProcessTiming::NotCalled), selected)),
+            );
         }
         self.counters(end, counts);
         self.service_end(end);
@@ -467,7 +527,7 @@ impl Capture {
             "INFO",
             "receive-diag",
             &format!(
-                "schema=2 status=started pid={} tid={} role={} duration_ms=180000 bin_ms=100 timer_origin=worker_setup media_coverage=unverified span_cpu=unsampled",
+                "schema=3 status=started pid={} tid={} role={} duration_ms=180000 bin_ms=100 timer_origin=worker_setup media_coverage=unverified span_cpu=unsampled",
                 capture.pid, capture.tid, capture.role
             ),
         );
@@ -573,10 +633,19 @@ impl Capture {
                 let phases: Vec<_> = bin.phases.iter().map(|s| serde_json::json!(s.fields())).collect();
                 let socket = bin.socket.map(|s| serde_json::json!([s.before,s.after,s.memory]));
                 let cpu_sample = bin.cpu_sample.map(|s| serde_json::json!([s.before,s.cpu,s.after]));
-                serde_json::json!({"index":index,"phases":phases,"raw":bin.raw,"bytes":bin.bytes,"idle":bin.idle,"errors":bin.errors,"accepted_authenticated":bin.accepted,"assembled":bin.assembled,"repaired":bin.repaired,"stun_ok":bin.handled_stun,"stun_invalid":bin.invalid_stun,"wrong_source":bin.wrong_source,"counter_discontinuities":bin.counter_discontinuities,"socket":socket,"cpu_sample":cpu_sample})
+                serde_json::json!({"index":index,"phases":phases,"raw":bin.raw,"bytes":bin.bytes,"idle":bin.idle,"errors":bin.errors,"accepted_authenticated":bin.accepted,"assembled":bin.assembled,"repaired":bin.repaired,"stun_ok":bin.handled_stun,"stun_invalid":bin.invalid_stun,"wrong_source":bin.wrong_source,"counter_discontinuities":bin.counter_discontinuities,"split_sampled_services":bin.split_sampled_services,"processed_services":bin.processed_services,"socket":socket,"cpu_sample":cpu_sample})
             }).collect();
-            let longs: Vec<_> = self.longs.iter().map(|s| serde_json::json!([s.phase,s.start.wall,s.end.wall,null,null])).collect();
-            let mut value = serde_json::json!({"schema":2,"phase_boundaries":PHASE_BOUNDARIES,"complete":complete,"preallocated_bytes":preallocated_bytes,"elapsed_ns":elapsed,"pid":self.pid,"tid":self.tid,"role":self.role,"realtime_origin_ns":self.realtime_ns,"clock":"Instant-relative-monotonic; realtime anchor approximate only","span_cpu":"unsampled; phase cpu_missing counts intentional absence of per-span CPU coverage","bin_ns":BIN_NS,"phase_names":PHASES,"phase_fields":["count","wall_ns","thread_cpu_ns","cpu_covered_wall_ns","cpu_missing","cpu_invalid","max_wall_ns"],"socket_fields":["before_ns","after_ns","SO_MEMINFO_u32"],"socket_memory_fields":["rmem_alloc","rcvbuf","wmem_alloc","sndbuf","fwd_alloc","wmem_queued","optmem","backlog","drops"],"long_fields":["phase","start_ns","end_ns","start_cpu_ns","end_cpu_ns"],"long_omitted":self.omitted,"cutoff_spans":self.cutoff_spans,"monotonic_anchor":self.monotonic_anchor,"final_socket":self.final_socket.map(|s|serde_json::json!([s.before,s.after,s.memory])),"socket_errors":self.socket_errors,"bins":bins,"long_spans":longs,"limits":"complete means timer reached, not full coverage. Partial exit can omit terminal in-flight phase/counters. Completion bins are not utilization bins. Delivered receive timing only; no kernel arrivals or scheduler trace. Socket drops are interval brackets; memory is not payload bytes. Non-CPU elapsed is not runqueue or blocking attribution."});
+            let longs: Vec<_> = self.longs.iter().map(|s| serde_json::json!([s.phase,s.start.wall,s.end.wall,null,null,s.inner_split_selected])).collect();
+            let mut value = serde_json::json!({"schema":3,"phase_boundaries":PHASE_BOUNDARIES,"complete":complete,"preallocated_bytes":preallocated_bytes,"elapsed_ns":elapsed,"pid":self.pid,"tid":self.tid,"role":self.role,"realtime_origin_ns":self.realtime_ns,"clock":"Instant-relative-monotonic; realtime anchor approximate only","span_cpu":"unsampled; phase cpu_missing counts intentional absence of per-span CPU coverage","bin_ns":BIN_NS,"phase_names":PHASES,"phase_fields":["count","wall_ns","thread_cpu_ns","cpu_covered_wall_ns","cpu_missing","cpu_invalid","max_wall_ns"],"socket_fields":["before_ns","after_ns","SO_MEMINFO_u32"],"socket_memory_fields":["rmem_alloc","rcvbuf","wmem_alloc","sndbuf","fwd_alloc","wmem_queued","optmem","backlog","drops"],"long_fields":["phase","start_ns","end_ns","start_cpu_ns","end_cpu_ns","inner_split_selected"],"long_omitted":self.omitted,"cutoff_spans":self.cutoff_spans,"monotonic_anchor":self.monotonic_anchor,"final_socket":self.final_socket.map(|s|serde_json::json!([s.before,s.after,s.memory])),"socket_errors":self.socket_errors,"bins":bins,"long_spans":longs,"limits":"complete means timer reached, not full coverage. Partial exit can omit terminal in-flight phase/counters. Completion bins are not utilization bins. Delivered receive timing only; no kernel arrivals or scheduler trace. Socket drops are interval brackets; memory is not payload bytes. Non-CPU elapsed is not runqueue or blocking attribution."});
+            value["phase_sampling"] = serde_json::json!({
+                "stride":SPLIT_STRIDE,"policy":"successful receive ordinals 1,17,33,... including startup/warmup",
+                "sampled_phases":["preprocess","process","forward"],
+                "completed_services":self.bins.iter().map(|b|b.phases[Phase::Service as usize].count).sum::<u64>(),
+                "selected_completed_services":self.bins.iter().map(|b|b.split_sampled_services).sum::<u64>(),
+                "processed_services":self.bins.iter().map(|b|b.processed_services).sum::<u64>(),
+                "selected_processed_services":self.bins.iter().map(|b|b.phases[Phase::Forward as usize].count).sum::<u64>(),
+                "limits":"Completion-bin denominators, not raw receipts. Unsampled Service tails retain full endpoints but no inner localization. Selected phases describe their cohort only: never extrapolate totals/maxima/percentiles. Deterministic stride may align with frame structure, not unbiased sampling. Tail selection=true does not override partial/cutoff/omission limits; per-span CPU remains unsampled."
+            });
             value["cpu_sampling"] = serde_json::json!({"policy":"one bracketed thread-CPU snapshot at the first worker opportunity per 100-ms bin, plus final snapshot","fields":["before_ns","thread_cpu_ns","after_ns"],"errors":self.cpu_sample_errors,"final":self.final_cpu_sample.map(|s|serde_json::json!([s.before,s.cpu,s.after])),"limits":"Worker-wide snapshot differences include receive, inline work, housekeeping and diagnostics. No per-span CPU or blocking/preemption/runqueue attribution; delayed worker means delayed snapshots."});
             value["media_coverage"] = serde_json::json!({"timer_origin":"worker_setup","first_authenticated_ns":self.first_authenticated_ns,"last_authenticated_ns":self.last_authenticated_ns,"first_assembled_ns":self.first_assembled_ns,"last_assembled_ns":self.last_assembled_ns,"limits":"Processing-completion endpoints only, not continuous media/decode/presentation or verified scene coverage. Startup is included; scene validation after timer start does not earn 180 seconds of valid scene."});
             value["long_policy"] = serde_json::json!({"threshold_ns":LONG_NS,"capacity":LONG_CAP,"receive_long_excluded":self.receive_long_excluded,"limits":"Receive has aggregate accounting only, never interval-tail records. Other phases share the capped tail pool; no full receive interval trace."});
@@ -665,14 +734,40 @@ mod tests {
             .unwrap()
             .cpu
             .unwrap();
-        let start = capture.stamp();
+        let receive_start = capture.receive_start(Instant::now(), None, false);
+        let receive_end = capture.receive_returned(receive_start, Some(1200), false);
+        let received_at = Instant::now();
+        let start = capture.stamp_at(received_at);
         let mut value = 1u64;
         for _ in 0..100_000 {
             value = std::hint::black_box(value.wrapping_mul(3));
         }
         std::hint::black_box(value);
-        let end = capture.stamp();
-        capture.span(Phase::Process, start, end);
+        let ProcessTiming::Sampled(end) = capture.process_returned(receive_end, received_at, true)
+        else {
+            panic!("selected smoke process missing");
+        };
+        capture.complete_iteration(
+            Instant::now(),
+            receive_end,
+            true,
+            ProcessTiming::Sampled(end),
+            true,
+            [1, 1, 0, 0, 0, 0],
+        );
+        let next_start = capture.receive_start(Instant::now(), None, false);
+        let stalled_receive = capture.receive_returned(next_start, Some(48), false);
+        let unsampled = capture.process_returned(stalled_receive, Instant::now(), false);
+        let stalled_end =
+            capture.origin + std::time::Duration::from_nanos(stalled_receive.wall + LONG_NS);
+        capture.complete_iteration(
+            stalled_end,
+            stalled_receive,
+            true,
+            unsampled,
+            false,
+            [2, 1, 0, 0, 0, 0],
+        );
         std::thread::sleep(std::time::Duration::from_millis(100));
         let loop_now = Instant::now();
         let sampled = Capture::checkpoint(&mut owner, &socket, loop_now).unwrap();
@@ -708,10 +803,25 @@ mod tests {
             assert!(Instant::now() < deadline, "export did not complete");
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        assert_eq!(value["schema"], 2);
+        assert_eq!(value["schema"], 3);
         assert_eq!(value["phase_boundaries"], PHASE_BOUNDARIES);
         assert_eq!(value["complete"], false);
         assert_eq!(value["socket_errors"], 0);
+        assert_eq!(value["phase_sampling"]["stride"], 16);
+        assert_eq!(value["phase_sampling"]["completed_services"], 2);
+        assert_eq!(value["phase_sampling"]["selected_completed_services"], 1);
+        assert_eq!(value["phase_sampling"]["processed_services"], 2);
+        assert_eq!(value["phase_sampling"]["selected_processed_services"], 1);
+        let service_tail = value["long_spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s[0] == Phase::Service as usize && s[5] == false)
+            .unwrap();
+        assert_eq!(
+            service_tail[2].as_u64().unwrap() - service_tail[1].as_u64().unwrap(),
+            LONG_NS
+        );
         assert_eq!(
             value["bins"][(end.wall / BIN_NS) as usize]["phases"][Phase::Process as usize],
             serde_json::json!([1, end.wall - start.wall, 0, 0, 1, 0, end.wall - start.wall])
@@ -756,13 +866,18 @@ mod tests {
         );
         let receive_end = capture.receive_returned(start, Some(1200), false);
         let received_at = Instant::now();
-        let process_end = capture.process_returned(receive_end, received_at);
+        let ProcessTiming::Sampled(process_end) =
+            capture.process_returned(receive_end, received_at, true)
+        else {
+            panic!("selected process missing");
+        };
         let finished = capture.origin + std::time::Duration::from_nanos(process_end.wall + LONG_NS);
         capture.complete_iteration(
             finished,
             receive_end,
             true,
-            Some(process_end),
+            ProcessTiming::Sampled(process_end),
+            true,
             [1, 1, 1, 0, 0, 0],
         );
         let end = capture.stamp_at(finished);
@@ -805,7 +920,14 @@ mod tests {
         // STUN/non-process path: full Preprocess/Service without fabricated Process/Forward.
         let mut stun = Capture::new();
         let at = stun.origin + std::time::Duration::from_nanos(200);
-        stun.complete_iteration(at, stamp(100), true, None, [0, 0, 0, 1, 0, 0]);
+        stun.complete_iteration(
+            at,
+            stamp(100),
+            true,
+            ProcessTiming::NotCalled,
+            true,
+            [0, 0, 0, 1, 0, 0],
+        );
         assert_eq!(
             stun.bins[0].phases[Phase::Preprocess as usize].fields(),
             [1, 100, 0, 0, 1, 0, 100]
@@ -819,10 +941,109 @@ mod tests {
         assert_eq!(stun.bins[0].handled_stun, 1);
         // Idle completion still advances counters/end but adds no Service or inner span.
         let at = stun.origin + std::time::Duration::from_nanos(300);
-        stun.complete_iteration(at, stamp(250), false, None, [0, 0, 0, 2, 0, 0]);
+        stun.complete_iteration(
+            at,
+            stamp(250),
+            false,
+            ProcessTiming::NotCalled,
+            false,
+            [0, 0, 0, 2, 0, 0],
+        );
         assert_eq!(stun.bins[0].phases[Phase::Service as usize].count, 1);
         assert_eq!(stun.bins[0].handled_stun, 2);
         assert_eq!(stun.last_service.unwrap().wall, 300);
+    }
+
+    #[test]
+    fn unsampled_service_stall_retains_envelope_without_inner_localization() {
+        assert_eq!(
+            (0..=40)
+                .filter(|&i| Capture::split_selected(i))
+                .collect::<Vec<_>>(),
+            vec![1, 17, 33]
+        );
+        let mut capture = Capture::new();
+        let start = capture.receive_start(Instant::now(), None, false);
+        let receive_end = capture.receive_returned(start, Some(1200), false);
+        let process =
+            capture.process_returned(receive_end, Instant::now(), Capture::split_selected(2));
+        assert!(matches!(process, ProcessTiming::Unsampled));
+        let at = capture.origin + std::time::Duration::from_nanos(receive_end.wall + LONG_NS + 100);
+        capture.complete_iteration(at, receive_end, true, process, false, [1, 1, 1, 0, 0, 0]);
+        let service = &capture.bins[(capture.stamp_at(at).wall / BIN_NS) as usize];
+        assert_eq!(
+            service.phases[Phase::Service as usize].fields(),
+            [1, LONG_NS + 100, 0, 0, 1, 0, LONG_NS + 100]
+        );
+        assert_eq!(
+            (service.split_sampled_services, service.processed_services),
+            (0, 1)
+        );
+        assert_eq!(capture.longs.len(), 1);
+        assert_eq!(capture.longs[0].phase, Phase::Service as usize);
+        assert_eq!(capture.longs[0].inner_split_selected, Some(false));
+        for phase in [Phase::Preprocess, Phase::Process, Phase::Forward] {
+            assert_eq!(
+                capture
+                    .bins
+                    .iter()
+                    .map(|b| b.phases[phase as usize].count)
+                    .sum::<u64>(),
+                0
+            );
+        }
+        assert_eq!(capture.bins.iter().map(|b| b.raw).sum::<u64>(), 1);
+        assert_eq!(capture.previous_counts, [1, 1, 1, 0, 0, 0]);
+        // Selected STUN service is selected coverage, but not processed coverage.
+        let at = at + std::time::Duration::from_nanos(100);
+        capture.complete_iteration(
+            at,
+            stamp(capture.stamp_at(at).wall - 50),
+            true,
+            ProcessTiming::NotCalled,
+            Capture::split_selected(17),
+            [1, 1, 1, 1, 0, 0],
+        );
+        assert_eq!(
+            capture
+                .bins
+                .iter()
+                .map(|b| b.split_sampled_services)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            capture
+                .bins
+                .iter()
+                .map(|b| b.processed_services)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            capture
+                .bins
+                .iter()
+                .map(|b| b.phases[Phase::Service as usize].count)
+                .sum::<u64>(),
+            2
+        );
+        assert_eq!(
+            capture
+                .bins
+                .iter()
+                .map(|b| b.phases[Phase::Preprocess as usize].count)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            capture
+                .bins
+                .iter()
+                .map(|b| b.phases[Phase::Forward as usize].count)
+                .sum::<u64>(),
+            0
+        );
     }
 
     #[test]

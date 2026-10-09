@@ -7508,12 +7508,19 @@ fn run_nvst_udp_receiver(
             )
         });
         #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
-        let mut process_end = None;
+        let mut process_timing = receive_diagnostics::ProcessTiming::NotCalled;
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        let mut split_selected = false;
         #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
         let received_datagram = receive_result.is_ok();
         match receive_result {
             Ok((length, source)) => 'datagram: {
                 inbound_datagrams += 1;
+                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                {
+                    split_selected =
+                        receive_diagnostics::Capture::split_selected(inbound_datagrams);
+                }
                 if inbound_datagrams == 1 {
                     log_udp_first_inbound(
                         "video",
@@ -7574,9 +7581,10 @@ fn run_nvst_udp_receiver(
                 let events = receiver.process_datagram(source, &datagram[..length], received_at);
                 #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
                 {
-                    process_end = diagnostic
-                        .as_mut()
-                        .map(|d| d.process_returned(receive_end.unwrap(), received_at));
+                    if let Some(d) = diagnostic.as_mut() {
+                        process_timing =
+                            d.process_returned(receive_end.unwrap(), received_at, split_selected);
+                    }
                 }
                 if !authenticated_before {
                     feedback.record_socket_receive(
@@ -7602,7 +7610,8 @@ fn run_nvst_udp_receiver(
                                 Instant::now(),
                                 receive_end.unwrap(),
                                 true,
-                                process_end,
+                                process_timing,
+                                split_selected,
                                 [
                                     receiver.authenticated_packets,
                                     receiver.frames_emitted,
@@ -7640,7 +7649,8 @@ fn run_nvst_udp_receiver(
                 now,
                 receive_end.unwrap(),
                 received_datagram,
-                process_end,
+                process_timing,
+                split_selected,
                 [
                     receiver.authenticated_packets,
                     receiver.frames_emitted,
