@@ -474,3 +474,659 @@ mod tests {
         assert_eq!(call.max_us, 20_000);
     }
 }
+
+// Decoder-local, opt-in host timings. These never enter the shared rolling probe.
+#[cfg(all(feature = "ffmpeg", feature = "vulkan"))]
+pub(crate) mod vulkan_frame {
+    use super::{Duration, Instant, STAGE_SAMPLE_CAPACITY, percentile_us};
+    use crate::{StreamFormat, VideoCodec};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // A copy attempt owns one observation, including a failed wait. Consumers
+    // must take it after that attempt; neither validation failure nor retries
+    // may reuse the preceding frame's wait.
+    #[derive(Default)]
+    pub(crate) struct FenceWaitObservation {
+        enabled: bool,
+        latest: Option<Duration>,
+    }
+    impl FenceWaitObservation {
+        pub(crate) fn enable(&mut self) {
+            self.enabled = true;
+        }
+        pub(crate) fn begin_attempt(&mut self) {
+            self.latest = None;
+        }
+        pub(crate) fn measure<T>(&mut self, wait: impl FnOnce() -> T) -> T {
+            let started = self.enabled.then(Instant::now);
+            let result = wait();
+            self.latest = started.map(|at| at.elapsed());
+            result
+        }
+        pub(crate) fn take(&mut self) -> Option<Duration> {
+            self.latest.take()
+        }
+    }
+
+    pub(crate) struct Attempt {
+        pub(crate) start: Instant,
+        utc_start_ns: Option<u64>,
+        prefix: bool,
+    }
+    #[derive(Debug)]
+    pub(crate) struct Batch {
+        pub(crate) decoder: u64,
+        pub(crate) seq: u64,
+        prefix_frames: usize,
+        pub(crate) format: StreamFormat,
+        pub(crate) first_frame: u64,
+        pub(crate) last_frame: u64,
+        pub(crate) utc_start_ns: Option<u64>,
+        pub(crate) utc_end_ns: Option<u64>,
+        pub(crate) monotonic_start_ns: u64,
+        pub(crate) monotonic_end_ns: u64,
+        pub(crate) sums_ns: [u64; 3],
+        pub(crate) quantiles_us: [[u64; 3]; 3],
+    }
+    pub(crate) struct Probe {
+        decoder: u64,
+        codec: VideoCodec,
+        origin: Instant,
+        format: Option<StreamFormat>,
+        pairs: [[u64; 3]; STAGE_SAMPLE_CAPACITY],
+        len: usize,
+        prefix_in_batch: usize,
+        pub(crate) submissions: u64,
+        pub(crate) submission_errors: u64,
+        prefix_outputs: u64,
+        extra_outputs: u64,
+        prefix_paired: u64,
+        pub(crate) no_output_submissions: u64,
+        discarded_prefix: u64,
+        first_frame: u64,
+        utc_start_ns: Option<u64>,
+        monotonic_start_ns: u64,
+        pub(crate) outputs: u64,
+        pub(crate) paired: u64,
+        pub(crate) batches: u64,
+        pub(crate) discarded: u64,
+        pub(crate) format_resets: u64,
+        pub(crate) receive_errors: u64,
+        pub(crate) conversion_errors: u64,
+        pub(crate) no_output: u64,
+        pub(crate) missing_wait: u64,
+        pub(crate) pair_errors: u64,
+        pub(crate) clock_errors: u64,
+        log_errors: u64,
+    }
+    fn utc_ns() -> Option<u64> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+            .try_into()
+            .ok()
+    }
+    fn ns(d: Duration) -> u64 {
+        d.as_nanos().try_into().unwrap_or(u64::MAX)
+    }
+    fn project_utc_start(utc: u64, anchor: Instant, start: Instant) -> Option<u64> {
+        utc.checked_sub(ns(anchor.checked_duration_since(start)?))
+    }
+    impl Probe {
+        pub(crate) fn new(enabled: bool, codec: VideoCodec) -> Option<Box<Self>> {
+            if !enabled {
+                return None;
+            }
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            Some(Box::new(Self {
+                decoder: NEXT.fetch_add(1, Ordering::Relaxed),
+                codec,
+                origin: Instant::now(),
+                format: None,
+                pairs: [[0; 3]; STAGE_SAMPLE_CAPACITY],
+                len: 0,
+                prefix_in_batch: 0,
+                submissions: 0,
+                submission_errors: 0,
+                prefix_outputs: 0,
+                extra_outputs: 0,
+                prefix_paired: 0,
+                no_output_submissions: 0,
+                discarded_prefix: 0,
+                first_frame: 0,
+                utc_start_ns: None,
+                monotonic_start_ns: 0,
+                outputs: 0,
+                paired: 0,
+                batches: 0,
+                discarded: 0,
+                format_resets: 0,
+                receive_errors: 0,
+                conversion_errors: 0,
+                no_output: 0,
+                missing_wait: 0,
+                pair_errors: 0,
+                clock_errors: 0,
+                log_errors: 0,
+            }))
+        }
+        pub(crate) fn begin(&self) -> Attempt {
+            self.begin_kind(false)
+        }
+        pub(crate) fn begin_prefix(&mut self) -> Attempt {
+            self.submissions += 1;
+            self.begin_kind(true)
+        }
+        fn begin_kind(&self, prefix: bool) -> Attempt {
+            let utc_start_ns = (self.len == 0).then(utc_ns).flatten();
+            Attempt {
+                start: Instant::now(),
+                utc_start_ns,
+                prefix,
+            }
+        }
+        pub(crate) fn next_attempt(&self, prefix: &mut Option<Attempt>) -> Attempt {
+            // The submission prefix is consumed ONCE, even on EAGAIN/error.
+            // Further outputs in the same drain are receive-only observations.
+            prefix.take().unwrap_or_else(|| self.begin())
+        }
+        pub(crate) fn note_no_output(&mut self, attempt: Option<&Attempt>) {
+            self.no_output += 1;
+            if attempt.is_some_and(|attempt| attempt.prefix) {
+                self.no_output_submissions += 1;
+            }
+        }
+        pub(crate) fn record(
+            &mut self,
+            format: Option<StreamFormat>,
+            attempt: Attempt,
+            received: Instant,
+            converted: Instant,
+            wait: Option<Duration>,
+        ) -> Option<Batch> {
+            self.record_with_anchor(format, attempt, received, converted, wait, || {
+                let utc = utc_ns()?;
+                Some((utc, Instant::now()))
+            })
+        }
+        fn record_with_anchor(
+            &mut self,
+            format: Option<StreamFormat>,
+            attempt: Attempt,
+            received: Instant,
+            converted: Instant,
+            wait: Option<Duration>,
+            anchor: impl FnOnce() -> Option<(u64, Instant)>,
+        ) -> Option<Batch> {
+            let Some(format) = format else {
+                self.conversion_errors += 1;
+                if attempt.prefix {
+                    self.no_output_submissions += 1;
+                }
+                return None;
+            };
+            self.outputs += 1;
+            if attempt.prefix {
+                self.prefix_outputs += 1;
+            } else {
+                self.extra_outputs += 1;
+            }
+            if self.format.is_some_and(|old| old != format) {
+                self.discarded += self.len as u64;
+                self.discarded_prefix += self.prefix_in_batch as u64;
+                self.len = 0;
+                self.prefix_in_batch = 0;
+                self.format_resets += 1;
+            }
+            self.format = Some(format);
+            let Some(wait) = wait else {
+                self.missing_wait += 1;
+                return None;
+            };
+            let receive = received.saturating_duration_since(attempt.start);
+            let conversion = converted.saturating_duration_since(received);
+            if wait > conversion || received < attempt.start || converted < received {
+                self.pair_errors += 1;
+                return None;
+            }
+            if self.len == 0 {
+                self.first_frame = self.outputs;
+                // Fresh UTC followed immediately by a monotonic anchor. Using
+                // anchor-start (NOT converted-start) includes delayed recording
+                // and conservatively bounds the first frame before a reset.
+                self.utc_start_ns = attempt.utc_start_ns.or_else(|| {
+                    let (utc, at) = anchor()?;
+                    project_utc_start(utc, at, attempt.start)
+                });
+                self.monotonic_start_ns = ns(attempt.start.saturating_duration_since(self.origin));
+            }
+            self.pairs[self.len] = [ns(receive), ns(conversion), ns(wait)];
+            self.len += 1;
+            self.paired += 1;
+            if attempt.prefix {
+                self.prefix_paired += 1;
+                self.prefix_in_batch += 1;
+            }
+            if self.len != STAGE_SAMPLE_CAPACITY {
+                return None;
+            }
+            let utc_end_ns = utc_ns();
+            if self.utc_start_ns.is_none() || utc_end_ns.is_none() || utc_end_ns < self.utc_start_ns
+            {
+                self.clock_errors += 1;
+            }
+            let mut sums_ns = [0u64; 3];
+            let mut quantiles_us = [[0; 3]; 3];
+            let mut sorted = [0; STAGE_SAMPLE_CAPACITY];
+            for stage in 0..3 {
+                for (i, pair) in self.pairs.iter().enumerate() {
+                    sorted[i] = pair[stage];
+                    sums_ns[stage] = sums_ns[stage].saturating_add(pair[stage]);
+                }
+                sorted.sort_unstable();
+                quantiles_us[stage] = [
+                    percentile_us(&sorted, 50),
+                    percentile_us(&sorted, 95),
+                    sorted[STAGE_SAMPLE_CAPACITY - 1] / 1_000,
+                ];
+            }
+            self.batches += 1;
+            let prefix_frames = self.prefix_in_batch;
+            self.len = 0;
+            self.prefix_in_batch = 0;
+            Some(Batch {
+                decoder: self.decoder,
+                seq: self.batches,
+                prefix_frames,
+                format,
+                first_frame: self.first_frame,
+                last_frame: self.outputs,
+                utc_start_ns: self.utc_start_ns,
+                utc_end_ns,
+                monotonic_start_ns: self.monotonic_start_ns,
+                monotonic_end_ns: ns(converted.saturating_duration_since(self.origin)),
+                sums_ns,
+                quantiles_us,
+            })
+        }
+        #[cfg(test)]
+        pub(crate) fn prefix_counts(&self) -> (u64, u64, u64) {
+            (self.prefix_outputs, self.extra_outputs, self.prefix_paired)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn bound_format(&self) -> Option<StreamFormat> {
+            self.format
+        }
+
+        fn coverage(&self) -> String {
+            format!(
+                "outputs={} paired={} batches={} partial={} discarded={} formatResets={} receiveErrors={} conversionErrors={} noOutputReceives={} missingWait={} pairErrors={} clockErrors={} logErrors={} submissions={} submissionErrors={} prefixOutputs={} extraOutputs={} prefixPaired={} noOutputSubmissions={} discardedPrefix={}",
+                self.outputs,
+                self.paired,
+                self.batches,
+                self.len,
+                self.discarded,
+                self.format_resets,
+                self.receive_errors,
+                self.conversion_errors,
+                self.no_output,
+                self.missing_wait,
+                self.pair_errors,
+                self.clock_errors,
+                self.log_errors,
+                self.submissions,
+                self.submission_errors,
+                self.prefix_outputs,
+                self.extra_outputs,
+                self.prefix_paired,
+                self.no_output_submissions,
+                self.discarded_prefix
+            )
+        }
+        pub(crate) fn emit(&mut self, batch: &Batch, writer: &mut impl std::io::Write) {
+            // Best-effort existing native stderr seam, captured privately by
+            // run-native.sh. Serialization/write are OUTSIDE measured stages,
+            // but synchronous writing can still perturb this worker.
+            let line = format!("{} {}\n", batch.line(self.codec), self.coverage());
+            if writer.write_all(line.as_bytes()).is_err() {
+                self.log_errors += 1;
+            }
+        }
+        fn close(&mut self, writer: &mut impl std::io::Write) {
+            let partial = self.len;
+            self.discarded += partial as u64;
+            self.discarded_prefix += self.prefix_in_batch as u64;
+            self.len = 0;
+            self.prefix_in_batch = 0;
+            let binding = self.format.map_or_else(|| "bound=0".to_owned(), |f|
+                format!("bound=1 mode=vulkan-shared device=adopted output=VULKAN width={} height={} format={:?}", f.width, f.height, f.pixel_format));
+            let line = format!(
+                "type=vulkan-frame-timing schema=2 status=closed pid={} decoder={} codec={} {} partialDiscarded={} {}\n",
+                std::process::id(),
+                self.decoder,
+                self.codec.label(),
+                binding,
+                partial,
+                self.coverage()
+            );
+            let _ = writer.write_all(line.as_bytes());
+        }
+    }
+    impl Batch {
+        fn line(&self, codec: VideoCodec) -> String {
+            let mut line = format!(
+                "type=vulkan-frame-timing schema=2 status=complete pid={} decoder={} seq={} mode=vulkan-shared device=adopted output=VULKAN codec={} width={} height={} format={:?} samples={} prefixFrames={} receiveOnlyFrames={} firstFrame={} lastFrame={} utcStartNs={} utcEndNs={} monotonicStartNs={} monotonicEndNs={}",
+                std::process::id(),
+                self.decoder,
+                self.seq,
+                codec.label(),
+                self.format.width,
+                self.format.height,
+                self.format.pixel_format,
+                STAGE_SAMPLE_CAPACITY,
+                self.prefix_frames,
+                STAGE_SAMPLE_CAPACITY - self.prefix_frames,
+                self.first_frame,
+                self.last_frame,
+                self.utc_start_ns.unwrap_or(0),
+                self.utc_end_ns.unwrap_or(0),
+                self.monotonic_start_ns,
+                self.monotonic_end_ns
+            );
+            for (i, label) in ["sendReceive", "conversion", "fenceWait"]
+                .iter()
+                .enumerate()
+            {
+                use std::fmt::Write;
+                let q = self.quantiles_us[i];
+                let _ = write!(
+                    line,
+                    " {label}SumNs={} {label}P50Us={} {label}P95Us={} {label}MaxUs={}",
+                    self.sums_ns[i], q[0], q[1], q[2]
+                );
+            }
+            line
+        }
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.close(&mut std::io::stderr().lock());
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn feed(
+            p: &mut Probe,
+            format: StreamFormat,
+            index: u64,
+            wait: Option<Duration>,
+        ) -> Option<Batch> {
+            let start = p.origin + Duration::from_millis(index);
+            p.record(
+                Some(format),
+                Attempt {
+                    start,
+                    utc_start_ns: Some(1),
+                    prefix: false,
+                },
+                start + Duration::from_micros(2),
+                start + Duration::from_micros(12),
+                wait,
+            )
+        }
+        #[test]
+        fn pairs_are_bounded_complete_nonoverlap_and_format_reset_discards_partial() {
+            let f = StreamFormat::video_default(256, 144).unwrap();
+            let mut p = Probe::new(true, VideoCodec::H265).unwrap();
+            for i in 0..255 {
+                assert!(feed(&mut p, f, i, Some(Duration::from_micros(7))).is_none());
+            }
+            let first = feed(&mut p, f, 255, Some(Duration::from_micros(7))).unwrap();
+            assert_eq!(first.sums_ns, [512_000, 2_560_000, 1_792_000]);
+            assert_eq!(first.quantiles_us, [[2, 2, 2], [10, 10, 10], [7, 7, 7]]);
+            assert_eq!(
+                (first.first_frame, first.last_frame, first.seq, p.len),
+                (1, 256, 1, 0)
+            );
+            for i in 256..512 {
+                let b = feed(&mut p, f, i, Some(Duration::from_micros(3)));
+                if i == 511 {
+                    let b = b.unwrap();
+                    assert_eq!((b.first_frame, b.last_frame, b.seq), (257, 512, 2));
+                    assert_eq!(b.sums_ns[2], 768_000);
+                } else {
+                    assert!(b.is_none());
+                }
+            }
+            feed(&mut p, f, 512, Some(Duration::from_micros(7)));
+            let changed = StreamFormat::video_default(512, 144).unwrap();
+            feed(&mut p, changed, 513, Some(Duration::from_micros(7)));
+            assert_eq!((p.discarded, p.format_resets, p.len), (1, 1, 1));
+            for i in 514..769 {
+                if let Some(b) = feed(&mut p, changed, i, Some(Duration::from_micros(7))) {
+                    assert_eq!(
+                        (b.format.width, b.first_frame, b.last_frame),
+                        (512, 514, 769)
+                    );
+                    let line = b.line(VideoCodec::H265);
+                    assert!(
+                        line.contains("mode=vulkan-shared device=adopted output=VULKAN codec=h265")
+                    );
+                    assert!(line.contains(
+                        "prefixFrames=0 receiveOnlyFrames=256 firstFrame=514 lastFrame=769"
+                    ));
+                    assert!(line.contains("fenceWaitSumNs=1792000"));
+                }
+            }
+            assert_eq!((p.batches, p.paired, p.len), (3, 769, 0));
+        }
+        #[test]
+        fn reset_without_attempt_utc_accounts_for_delayed_recording() {
+            let mut p = Probe::new(true, VideoCodec::H265).unwrap();
+            let old = StreamFormat::video_default(256, 144).unwrap();
+            let new = StreamFormat::video_default(512, 144).unwrap();
+            feed(&mut p, old, 0, Some(Duration::from_micros(7)));
+            let start = p.origin + Duration::from_micros(100);
+            let received = start + Duration::from_micros(2);
+            let converted = start + Duration::from_micros(12);
+            let anchor = p.origin + Duration::from_micros(1000); // 888 us after conversion
+            assert!(
+                p.record_with_anchor(
+                    Some(new),
+                    Attempt {
+                        start,
+                        utc_start_ns: None,
+                        prefix: true
+                    },
+                    received,
+                    converted,
+                    Some(Duration::from_micros(7)),
+                    || Some((10_000_000, anchor))
+                )
+                .is_none()
+            );
+            assert_eq!(
+                (p.format_resets, p.discarded, p.len, p.utc_start_ns),
+                (1, 1, 1, Some(9_100_000))
+            );
+            // The old projection would yield 9_988_000 and falsely include
+            // this batch in a window starting at 9_500_000.
+            assert!(p.utc_start_ns.unwrap() < 9_500_000);
+            let mut batch = None;
+            for i in 1..256 {
+                batch = feed(&mut p, new, i, Some(Duration::from_micros(7)));
+            }
+            let batch = batch.unwrap();
+            assert_eq!(
+                (batch.utc_start_ns, batch.prefix_frames),
+                (Some(9_100_000), 1)
+            );
+        }
+        #[test]
+        fn submission_prefix_is_charged_once_and_no_output_calls_remain_visible() {
+            let mut p = Probe::new(true, VideoCodec::H265).unwrap();
+            let f = StreamFormat::video_default(256, 144).unwrap();
+            let mut prefix = Some(p.begin_prefix());
+            let first = p.next_attempt(&mut prefix);
+            assert!(first.prefix);
+            assert!(prefix.is_none());
+            let start = first.start;
+            p.record(
+                Some(f),
+                first,
+                start + Duration::from_micros(11),
+                start + Duration::from_micros(21),
+                Some(Duration::from_micros(7)),
+            );
+            for _ in 0..2 {
+                let next = p.next_attempt(&mut prefix);
+                assert!(!next.prefix);
+                let start = next.start;
+                p.record(
+                    Some(f),
+                    next,
+                    start + Duration::from_micros(2),
+                    start + Duration::from_micros(12),
+                    Some(Duration::from_micros(7)),
+                );
+            }
+            assert_eq!(
+                (
+                    p.submissions,
+                    p.prefix_outputs,
+                    p.extra_outputs,
+                    p.prefix_in_batch
+                ),
+                (1, 1, 2, 1)
+            );
+            assert_eq!(p.pairs[..3].iter().map(|pair| pair[0]).sum::<u64>(), 15_000);
+            let mut empty = Some(p.begin_prefix());
+            let attempt = p.next_attempt(&mut empty);
+            p.note_no_output(Some(&attempt));
+            let next = p.next_attempt(&mut empty);
+            p.note_no_output(Some(&next));
+            assert_eq!(
+                (
+                    p.submissions,
+                    p.no_output_submissions,
+                    p.no_output,
+                    p.paired
+                ),
+                (2, 1, 2, 3)
+            );
+            let mut batch = None;
+            for i in 3..256 {
+                batch = feed(&mut p, f, i, Some(Duration::from_micros(7)));
+            }
+            let batch = batch.unwrap();
+            assert_eq!(batch.prefix_frames, 1);
+            assert!(
+                batch
+                    .line(VideoCodec::H265)
+                    .contains("samples=256 prefixFrames=1 receiveOnlyFrames=255")
+            );
+        }
+        #[test]
+        fn logging_failure_and_destruction_keep_explicit_coverage_without_changing_pairs() {
+            struct Broken;
+            impl std::io::Write for Broken {
+                fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut p = Probe::new(true, VideoCodec::H265).unwrap();
+            let f = StreamFormat::video_default(256, 144).unwrap();
+            let mut batch = None;
+            for i in 0..256 {
+                batch = feed(&mut p, f, i, Some(Duration::from_micros(7)));
+            }
+            let batch = batch.unwrap();
+            p.emit(&batch, &mut Broken);
+            assert_eq!(
+                (p.log_errors, p.outputs, p.paired, p.batches, p.len),
+                (1, 256, 256, 1, 0)
+            );
+            let mut bytes = Vec::new();
+            p.emit(&batch, &mut bytes);
+            let line = String::from_utf8(bytes).unwrap();
+            assert!(
+                line.contains("prefixFrames=0 receiveOnlyFrames=256 firstFrame=1 lastFrame=256")
+            );
+            assert!(line.contains("sendReceiveSumNs=512000"));
+            assert!(line.contains("logErrors=1"));
+            feed(&mut p, f, 256, Some(Duration::from_micros(7)));
+            let mut bytes = Vec::new();
+            p.close(&mut bytes);
+            let closed = String::from_utf8(bytes).unwrap();
+            assert!(closed.contains(
+                "bound=1 mode=vulkan-shared device=adopted output=VULKAN width=256 height=144"
+            ));
+            assert!(closed.contains("partialDiscarded=1"));
+            assert!(closed.contains("partial=0 discarded=1"));
+            assert_eq!((p.outputs, p.paired, p.discarded), (257, 257, 1));
+            println!(
+                "fixed_probe_bytes={} pair_storage_bytes={}",
+                std::mem::size_of::<Probe>(),
+                std::mem::size_of::<[[u64; 3]; STAGE_SAMPLE_CAPACITY]>()
+            );
+        }
+        #[test]
+        fn disabled_and_failed_attempts_cannot_reuse_or_pollute_observations() {
+            assert!(Probe::new(false, VideoCodec::H265).is_none());
+            let mut wait = FenceWaitObservation::default();
+            assert_eq!(wait.measure(|| Err::<(), _>(17)), Err(17));
+            assert!(wait.take().is_none());
+            wait.enable();
+            assert_eq!(wait.measure(|| Err::<(), _>(23)), Err(23));
+            assert!(wait.take().is_some());
+            assert!(wait.take().is_none());
+            wait.measure(|| ());
+            wait.begin_attempt();
+            assert!(wait.take().is_none());
+            let mut p = Probe::new(true, VideoCodec::H265).unwrap();
+            let f = StreamFormat::video_default(256, 144).unwrap();
+            let start = p.origin;
+            assert!(
+                p.record(
+                    None,
+                    Attempt {
+                        start,
+                        utc_start_ns: Some(1),
+                        prefix: false,
+                    },
+                    start + Duration::from_micros(2),
+                    start + Duration::from_micros(12),
+                    Some(Duration::from_micros(7))
+                )
+                .is_none()
+            );
+            assert_eq!(
+                (p.outputs, p.paired, p.len, p.conversion_errors),
+                (0, 0, 0, 1)
+            );
+            feed(&mut p, f, 0, None);
+            feed(&mut p, f, 1, Some(Duration::from_micros(11)));
+            for i in 2..258 {
+                feed(&mut p, f, i, Some(Duration::from_micros(7)));
+            }
+            assert_eq!(
+                (
+                    p.outputs,
+                    p.paired,
+                    p.batches,
+                    p.missing_wait,
+                    p.pair_errors
+                ),
+                (258, 256, 1, 1, 1)
+            );
+            assert!(p.coverage().contains("conversionErrors=1"));
+        }
+    }
+}

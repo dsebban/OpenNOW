@@ -58,6 +58,7 @@ pub(super) struct VulkanCopyPool {
     slots: Vec<Arc<Snapshot>>,
     retirement: SyncSender<Retirement>,
     source: Option<frame::Video>,
+    frame_timing: crate::timing::vulkan_frame::FenceWaitObservation,
 }
 
 struct Retirement {
@@ -201,7 +202,20 @@ impl VulkanCopyPool {
             slots: Vec::new(),
             retirement,
             source: None,
+            frame_timing: Default::default(),
         })
+    }
+
+    pub(super) fn enable_frame_timing(&mut self) {
+        self.frame_timing.enable();
+    }
+
+    pub(super) fn clear_fence_wait(&mut self) {
+        self.frame_timing.begin_attempt();
+    }
+
+    pub(super) fn take_fence_wait(&mut self) -> Option<std::time::Duration> {
+        self.frame_timing.take()
     }
 
     pub(super) fn copy(
@@ -209,6 +223,7 @@ impl VulkanCopyPool {
         decoded: &frame::Video,
         fallback_timestamp_us: u64,
     ) -> Result<DecodedVideoFrame> {
+        self.frame_timing.begin_attempt();
         let result = self.copy_frame(decoded, fallback_timestamp_us);
         if matches!(&result, Err(Error::DeviceLost { .. })) {
             self.failed = true;
@@ -376,10 +391,10 @@ impl VulkanCopyPool {
         result?;
         self.pending = true;
         self.source = Some(retained);
-        if let Err(error) = unsafe {
+        if let Err(error) = self.frame_timing.measure(|| unsafe {
             self.device
                 .wait_for_fences(&[self.fence], true, COPY_TIMEOUT_NS)
-        } {
+        }) {
             self.failed = true;
             self.owner.invalidate();
             return Err(failure("wait for GPU presentation snapshot", error));

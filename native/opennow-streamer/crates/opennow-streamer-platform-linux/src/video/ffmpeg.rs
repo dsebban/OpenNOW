@@ -65,6 +65,8 @@ pub(crate) struct FfmpegDecoder {
     shared_device: Option<Arc<crate::SharedVulkanDevice>>,
     #[cfg(feature = "vulkan")]
     snapshot_pool: Option<super::vulkan_copy::VulkanCopyPool>,
+    #[cfg(feature = "vulkan")]
+    frame_timing: Option<Box<crate::timing::vulkan_frame::Probe>>,
 }
 
 struct HardwareFormatSelection {
@@ -298,6 +300,13 @@ impl FfmpegDecoder {
                     ),
                 )
             })?;
+        #[cfg(feature = "vulkan")]
+        let frame_timing = crate::timing::vulkan_frame::Probe::new(
+            shared_device.is_some()
+                && mode == FfmpegMode::Vulkan
+                && std::env::var("OPENNOW_VULKAN_FRAME_TIMING").is_ok_and(|value| value == "1"),
+            codec,
+        );
         Ok(Self {
             decoder,
             wanted_hw_format,
@@ -314,6 +323,8 @@ impl FfmpegDecoder {
             shared_device,
             #[cfg(feature = "vulkan")]
             snapshot_pool: None,
+            #[cfg(feature = "vulkan")]
+            frame_timing,
         })
     }
 
@@ -331,15 +342,83 @@ impl FfmpegDecoder {
         ))
     }
 
-    fn drain(&mut self, draining: bool) -> Result<Vec<DecodedVideoFrame>> {
+    fn drain(
+        &mut self,
+        draining: bool,
+        #[cfg(feature = "vulkan")] mut prefix: Option<crate::timing::vulkan_frame::Attempt>,
+    ) -> Result<Vec<DecodedVideoFrame>> {
         let mut frames = Vec::new();
         loop {
             let mut decoded = frame::Video::empty();
+            #[cfg(feature = "vulkan")]
+            let attempt = self
+                .frame_timing
+                .as_ref()
+                .map(|probe| probe.next_attempt(&mut prefix));
             match self.decoder.receive_frame(&mut decoded) {
-                Ok(()) => frames.push(self.convert_frame(&decoded)?),
-                Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => break,
-                Err(ffmpeg::Error::Eof) if draining => break,
+                Ok(()) => {
+                    #[cfg(feature = "vulkan")]
+                    let received = attempt.as_ref().map(|_| std::time::Instant::now());
+                    #[cfg(feature = "vulkan")]
+                    if attempt.is_some()
+                        && let Some(pool) = self.snapshot_pool.as_mut()
+                    {
+                        pool.clear_fence_wait();
+                    }
+                    let converted = self.convert_frame(&decoded);
+                    #[cfg(feature = "vulkan")]
+                    if let Some(attempt) = attempt {
+                        let finished = std::time::Instant::now();
+                        let wait = self
+                            .snapshot_pool
+                            .as_mut()
+                            .and_then(|pool| pool.take_fence_wait());
+                        let probe = self.frame_timing.as_mut().expect("enabled attempt");
+                        match &converted {
+                            Ok(output)
+                                if decoded.format() == Pixel::VULKAN
+                                    && output
+                                        .vulkan
+                                        .as_ref()
+                                        .is_some_and(|frame| frame.completed_gpu_copy()) =>
+                            {
+                                if let Some(batch) = probe.record(
+                                    Some(output.format),
+                                    attempt,
+                                    received.expect("enabled receive"),
+                                    finished,
+                                    wait,
+                                ) {
+                                    probe.emit(&batch, &mut std::io::stderr().lock());
+                                }
+                            }
+                            _ => {
+                                probe.record(None, attempt, received.unwrap(), finished, wait);
+                            }
+                        }
+                    }
+                    frames.push(converted?);
+                }
+                Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {
+                    #[cfg(feature = "vulkan")]
+                    if let Some(probe) = self.frame_timing.as_mut() {
+                        probe.note_no_output(attempt.as_ref());
+                    }
+                    break;
+                }
+                Err(ffmpeg::Error::Eof) if draining => {
+                    #[cfg(feature = "vulkan")]
+                    if let Some(probe) = self.frame_timing.as_mut() {
+                        probe.note_no_output(attempt.as_ref());
+                    }
+                    break;
+                }
                 Err(error) => {
+                    #[cfg(feature = "vulkan")]
+                    if let Some(probe) = self.frame_timing.as_mut() {
+                        probe.receive_errors += 1;
+                        probe.note_no_output(attempt.as_ref());
+                    }
                     return Err(self.decode_error("frame receive", error));
                 }
             }
@@ -402,6 +481,12 @@ impl FfmpegDecoder {
             if self.snapshot_pool.is_none() {
                 self.snapshot_pool =
                     Some(super::vulkan_copy::VulkanCopyPool::new(Arc::clone(device))?);
+                if self.frame_timing.is_some() {
+                    self.snapshot_pool
+                        .as_mut()
+                        .expect("created pool")
+                        .enable_frame_timing();
+                }
             }
             let mut output = self
                 .snapshot_pool
@@ -1185,19 +1270,45 @@ impl VideoDecoder for FfmpegDecoder {
         if frame.keyframe {
             packet.set_flags(ffmpeg::packet::Flags::KEY);
         }
-        self.decoder
-            .send_packet(&packet)
-            .map_err(|error| self.decode_error("packet submission", error))?;
-        self.drain(false)
+        // Replaces the first receive-start clock; packet preparation above is
+        // intentionally excluded. Subsequent drain outputs are receive-only.
+        #[cfg(feature = "vulkan")]
+        let prefix = self.frame_timing.as_mut().map(|probe| probe.begin_prefix());
+        self.decoder.send_packet(&packet).map_err(|error| {
+            #[cfg(feature = "vulkan")]
+            if let Some(probe) = self.frame_timing.as_mut() {
+                probe.submission_errors += 1;
+                probe.no_output_submissions += 1;
+            }
+            self.decode_error("packet submission", error)
+        })?;
+        self.drain(
+            false,
+            #[cfg(feature = "vulkan")]
+            prefix,
+        )
     }
 
     fn flush(&mut self) -> Result<Vec<DecodedVideoFrame>> {
+        #[cfg(feature = "vulkan")]
+        let prefix = self.frame_timing.as_mut().map(|probe| probe.begin_prefix());
         match self.decoder.send_eof() {
-            Ok(()) | Err(ffmpeg::Error::Eof) => self.drain(true),
-            Err(error) => Err(Error::backend(
-                Subsystem::Ffmpeg,
-                format!("{} decoder flush failed: {error}", self.mode.label()),
-            )),
+            Ok(()) | Err(ffmpeg::Error::Eof) => self.drain(
+                true,
+                #[cfg(feature = "vulkan")]
+                prefix,
+            ),
+            Err(error) => {
+                #[cfg(feature = "vulkan")]
+                if let Some(probe) = self.frame_timing.as_mut() {
+                    probe.submission_errors += 1;
+                    probe.no_output_submissions += 1;
+                }
+                Err(Error::backend(
+                    Subsystem::Ffmpeg,
+                    format!("{} decoder flush failed: {error}", self.mode.label()),
+                ))
+            }
         }
     }
 
@@ -1980,10 +2091,36 @@ mod tests {
         );
         let mut decoder =
             FfmpegDecoder::open_shared(VideoCodec::H265, format, Arc::clone(&owner)).unwrap();
+        decoder.frame_timing = crate::timing::vulkan_frame::Probe::new(true, VideoCodec::H265);
         let packet = EncodedVideoFrame::new(encoded.stdout, 1, true).unwrap();
         let mut frames = decoder.decode(&packet).unwrap();
         frames.extend(decoder.flush().unwrap());
         assert_eq!(frames.len(), 1);
+        let probe = decoder.frame_timing.as_ref().unwrap();
+        assert_eq!(
+            (
+                probe.outputs,
+                probe.paired,
+                probe.missing_wait,
+                probe.pair_errors,
+                probe.conversion_errors,
+                probe.receive_errors
+            ),
+            (1, 1, 0, 0, 0, 0)
+        );
+        assert_eq!(probe.bound_format(), Some(format));
+        assert_eq!(probe.prefix_counts(), (1, 0, 1));
+        assert_eq!(probe.submission_errors, 0);
+        assert_eq!(decoder.mode, FfmpegMode::Vulkan);
+        assert!(decoder.shared_device.is_some());
+        assert!(
+            decoder
+                .snapshot_pool
+                .as_mut()
+                .unwrap()
+                .take_fence_wait()
+                .is_none()
+        );
         let frame = frames.remove(0);
         frame.validate().unwrap();
         assert!(frame.planes.is_empty());
