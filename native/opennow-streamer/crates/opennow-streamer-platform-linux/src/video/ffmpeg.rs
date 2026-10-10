@@ -67,6 +67,10 @@ pub(crate) struct FfmpegDecoder {
     snapshot_pool: Option<super::vulkan_copy::VulkanCopyPool>,
     #[cfg(feature = "vulkan")]
     frame_timing: Option<Box<crate::timing::vulkan_frame::Probe>>,
+    #[cfg(feature = "vulkan")]
+    defer_snapshot_wait: bool,
+    #[cfg(feature = "vulkan")]
+    snapshot_arm: Option<(bool, u64)>,
 }
 
 struct HardwareFormatSelection {
@@ -96,6 +100,29 @@ fn vaapi_device_policy(
         }
         _ => VaapiDevicePolicy::Default,
     }
+}
+
+#[cfg(feature = "vulkan")]
+fn snapshot_wait_setting(
+    shared_vulkan: bool,
+    value: Option<&str>,
+    probe: bool,
+) -> Result<(bool, Option<bool>)> {
+    if !shared_vulkan {
+        return Ok((false, None));
+    }
+    let arm = match value {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    };
+    if arm == Some(true) && probe {
+        return Err(Error::unavailable(
+            Subsystem::Vulkan,
+            "deferred snapshot wait cannot be combined with frame timing",
+        ));
+    }
+    Ok((arm == Some(true), arm))
 }
 
 impl FfmpegDecoder {
@@ -137,6 +164,19 @@ impl FfmpegDecoder {
         mode: FfmpegMode,
         shared_device: Option<Arc<crate::SharedVulkanDevice>>,
     ) -> Result<Self> {
+        #[cfg(feature = "vulkan")]
+        let shared_vulkan = shared_device.is_some() && mode == FfmpegMode::Vulkan;
+        #[cfg(feature = "vulkan")]
+        let probe_enabled = shared_vulkan
+            && std::env::var("OPENNOW_VULKAN_FRAME_TIMING").is_ok_and(|value| value == "1");
+        #[cfg(feature = "vulkan")]
+        let (defer_snapshot_wait, explicit_arm) = snapshot_wait_setting(
+            shared_vulkan,
+            std::env::var("OPENNOW_VULKAN_DEFER_SNAPSHOT_WAIT")
+                .ok()
+                .as_deref(),
+            probe_enabled,
+        )?;
         format.validate()?;
         if format.pixel_format.is_444() && (mode != FfmpegMode::Vulkan || shared_device.is_none()) {
             return Err(Error::unavailable(
@@ -301,12 +341,7 @@ impl FfmpegDecoder {
                 )
             })?;
         #[cfg(feature = "vulkan")]
-        let frame_timing = crate::timing::vulkan_frame::Probe::new(
-            shared_device.is_some()
-                && mode == FfmpegMode::Vulkan
-                && std::env::var("OPENNOW_VULKAN_FRAME_TIMING").is_ok_and(|value| value == "1"),
-            codec,
-        );
+        let frame_timing = crate::timing::vulkan_frame::Probe::new(probe_enabled, codec);
         Ok(Self {
             decoder,
             wanted_hw_format,
@@ -325,6 +360,17 @@ impl FfmpegDecoder {
             snapshot_pool: None,
             #[cfg(feature = "vulkan")]
             frame_timing,
+            #[cfg(feature = "vulkan")]
+            defer_snapshot_wait,
+            #[cfg(feature = "vulkan")]
+            snapshot_arm: explicit_arm.map(|arm| {
+                static NEXT_ARM: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                (
+                    arm,
+                    NEXT_ARM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                )
+            }),
         })
     }
 
@@ -479,8 +525,10 @@ impl FfmpegDecoder {
                 ));
             }
             if self.snapshot_pool.is_none() {
-                self.snapshot_pool =
-                    Some(super::vulkan_copy::VulkanCopyPool::new(Arc::clone(device))?);
+                self.snapshot_pool = Some(super::vulkan_copy::VulkanCopyPool::new(
+                    Arc::clone(device),
+                    self.defer_snapshot_wait,
+                )?);
                 if self.frame_timing.is_some() {
                     self.snapshot_pool
                         .as_mut()
@@ -502,6 +550,29 @@ impl FfmpegDecoder {
             if output.format != self.configured_format {
                 self.configured_format = output.format;
                 self.pending_format_change = Some(output.format);
+            }
+            if let Some((deferred, instance)) = self.snapshot_arm.take() {
+                use std::io::Write;
+                // Private fixed-label arm receipt, once after a real successful output.
+                // Logging failure is not a playback failure; no peer text or handles.
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "type=vulkan-snapshot-arm schema=1 status=output pid={} instance={} deferred={} mode=VULKAN shared=1 adopted=1 output=VULKAN codec={} width={} height={} tenBit={} chroma444={} completed={}",
+                    std::process::id(),
+                    instance,
+                    u8::from(deferred),
+                    self.codec.label(),
+                    output.format.width,
+                    output.format.height,
+                    u8::from(output.format.pixel_format.is_ten_bit()),
+                    u8::from(output.format.pixel_format.is_444()),
+                    u8::from(
+                        output
+                            .vulkan
+                            .as_ref()
+                            .is_some_and(|frame| frame.completed_gpu_copy())
+                    )
+                );
             }
             return Ok(output);
         }
@@ -1553,7 +1624,7 @@ fn decoded_metadata(frame: &frame::Video, defaults: StreamFormat) -> Result<Stre
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::fs::File;
     use std::os::fd::AsRawFd;
     use std::process::Command;
@@ -2046,15 +2117,7 @@ mod tests {
     }
 
     #[cfg(feature = "vulkan")]
-    fn shared_hevc_snapshot(pixel_format: PixelFormat) {
-        let owner =
-            crate::SharedVulkanDevice::create().expect("shared Vulkan device must initialize");
-        let mut format = StreamFormat::video_default(256, 144).unwrap();
-        format.pixel_format = pixel_format;
-        assert!(
-            owner.supports_format(VideoCodec::H265, pixel_format, 256, 144),
-            "requested HEVC profile must be supported"
-        );
+    fn shared_hevc_packet(pixel_format: PixelFormat, width: u32, height: u32) -> EncodedVideoFrame {
         let encoded = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
@@ -2063,7 +2126,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc2=size=256x144:rate=60",
+                &format!("testsrc2=size={width}x{height}:rate=60"),
                 "-frames:v",
                 "1",
                 "-pix_fmt",
@@ -2089,28 +2152,122 @@ mod tests {
             "HEVC sample encode failed: {}",
             String::from_utf8_lossy(&encoded.stderr)
         );
+        EncodedVideoFrame::new(encoded.stdout, 1, true).unwrap()
+    }
+
+    #[cfg(feature = "vulkan")]
+    pub(in crate::video) fn shared_hevc_source(
+        owner: Arc<crate::SharedVulkanDevice>,
+        width: u32,
+        height: u32,
+    ) -> frame::Video {
+        let mut format = StreamFormat::video_default(width, height).unwrap();
+        format.pixel_format = PixelFormat::P010;
+        let mut decoder = FfmpegDecoder::open_shared(VideoCodec::H265, format, owner).unwrap();
+        let encoded = shared_hevc_packet(PixelFormat::P010, width, height);
+        let packet = ffmpeg::Packet::copy(&encoded.data);
+        decoder.decoder.send_packet(&packet).unwrap();
+        decoder.decoder.send_eof().unwrap();
+        let mut raw = frame::Video::empty();
+        decoder.decoder.receive_frame(&mut raw).unwrap();
+        assert_eq!(raw.format(), Pixel::VULKAN);
+        raw
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn deferred_snapshot_gate_preserves_unset_and_rejects_probe_conflict() {
+        assert_eq!(
+            snapshot_wait_setting(true, None, false).unwrap(),
+            (false, None)
+        );
+        assert_eq!(
+            snapshot_wait_setting(true, Some("0"), false).unwrap(),
+            (false, Some(false))
+        );
+        assert_eq!(
+            snapshot_wait_setting(true, Some("1"), false).unwrap(),
+            (true, Some(true))
+        );
+        assert!(snapshot_wait_setting(true, Some("1"), true).is_err());
+        assert_eq!(
+            snapshot_wait_setting(false, Some("1"), true).unwrap(),
+            (false, None)
+        );
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "opt-in: requires Vulkan Video Main10 GPU; run with both probe and deferred flags=1"]
+    fn deferred_snapshot_constructor_rejects_conflicting_probes() {
+        assert_eq!(
+            std::env::var("OPENNOW_VULKAN_FRAME_TIMING").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(
+            std::env::var("OPENNOW_VULKAN_DEFER_SNAPSHOT_WAIT").as_deref(),
+            Ok("1")
+        );
+        let owner = crate::SharedVulkanDevice::create().unwrap();
+        let mut format = StreamFormat::video_default(256, 144).unwrap();
+        format.pixel_format = PixelFormat::P010;
+        let result = FfmpegDecoder::open_shared(VideoCodec::H265, format, owner);
+        assert!(matches!(
+            result,
+            Err(Error::Unavailable {
+                subsystem: Subsystem::Vulkan,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "opt-in: requires Vulkan Video Main10 GPU and FFmpeg CLI/libx265"]
+    fn deferred_shared_vulkan_hevc_p010_gpu_only() {
+        shared_hevc_snapshot(PixelFormat::P010, true);
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn shared_hevc_snapshot(pixel_format: PixelFormat, deferred: bool) {
+        let owner =
+            crate::SharedVulkanDevice::create().expect("shared Vulkan device must initialize");
+        let mut format = StreamFormat::video_default(256, 144).unwrap();
+        format.pixel_format = pixel_format;
+        assert!(
+            owner.supports_format(VideoCodec::H265, pixel_format, 256, 144),
+            "requested HEVC profile must be supported"
+        );
+        let packet = shared_hevc_packet(pixel_format, 256, 144);
         let mut decoder =
             FfmpegDecoder::open_shared(VideoCodec::H265, format, Arc::clone(&owner)).unwrap();
-        decoder.frame_timing = crate::timing::vulkan_frame::Probe::new(true, VideoCodec::H265);
-        let packet = EncodedVideoFrame::new(encoded.stdout, 1, true).unwrap();
+        assert_eq!(
+            decoder.defer_snapshot_wait, deferred,
+            "fixture arm must match constructor environment"
+        );
+        decoder.frame_timing = crate::timing::vulkan_frame::Probe::new(!deferred, VideoCodec::H265);
         let mut frames = decoder.decode(&packet).unwrap();
         frames.extend(decoder.flush().unwrap());
         assert_eq!(frames.len(), 1);
-        let probe = decoder.frame_timing.as_ref().unwrap();
-        assert_eq!(
-            (
-                probe.outputs,
-                probe.paired,
-                probe.missing_wait,
-                probe.pair_errors,
-                probe.conversion_errors,
-                probe.receive_errors
-            ),
-            (1, 1, 0, 0, 0, 0)
-        );
-        assert_eq!(probe.bound_format(), Some(format));
-        assert_eq!(probe.prefix_counts(), (1, 0, 1));
-        assert_eq!(probe.submission_errors, 0);
+        if !deferred {
+            let probe = decoder.frame_timing.as_ref().unwrap();
+            assert_eq!(
+                (
+                    probe.outputs,
+                    probe.paired,
+                    probe.missing_wait,
+                    probe.pair_errors,
+                    probe.conversion_errors,
+                    probe.receive_errors
+                ),
+                (1, 1, 0, 0, 0, 0)
+            );
+            assert_eq!(probe.bound_format(), Some(format));
+            assert_eq!(probe.prefix_counts(), (1, 0, 1));
+            assert_eq!(probe.submission_errors, 0);
+        } else {
+            assert!(decoder.frame_timing.is_none());
+        }
         assert_eq!(decoder.mode, FfmpegMode::Vulkan);
         assert!(decoder.shared_device.is_some());
         assert!(
@@ -2128,7 +2285,7 @@ mod tests {
         assert_eq!(frame.format.pixel_format, format.pixel_format);
         let vulkan = frame.vulkan.as_ref().unwrap();
         assert_eq!(vulkan.device, owner.info().device);
-        assert!(vulkan.completed_gpu_copy());
+        assert_eq!(vulkan.completed_gpu_copy(), !deferred);
         assert_eq!(vulkan.images.len(), 2);
         let divisor = if pixel_format.is_444() { 1 } else { 2 };
         assert_eq!(vulkan.images[1].width, format.width / divisor);
@@ -2161,28 +2318,28 @@ mod tests {
     #[test]
     #[ignore = "opt-in: requires a Vulkan Video HEVC GPU with an isolated Qt graphics queue and FFmpeg CLI/libx265"]
     fn shared_vulkan_hevc_nv12_gpu_only() {
-        shared_hevc_snapshot(PixelFormat::Nv12);
+        shared_hevc_snapshot(PixelFormat::Nv12, false);
     }
 
     #[cfg(feature = "vulkan")]
     #[test]
     #[ignore = "opt-in: requires a Vulkan Video HEVC Main10 GPU with an isolated Qt graphics queue and FFmpeg CLI/libx265"]
     fn shared_vulkan_hevc_p010_gpu_only() {
-        shared_hevc_snapshot(PixelFormat::P010);
+        shared_hevc_snapshot(PixelFormat::P010, false);
     }
 
     #[cfg(feature = "vulkan")]
     #[test]
     #[ignore = "opt-in: requires Vulkan Video HEVC Range Extensions 8-bit 4:4:4 GPU support, an isolated Qt graphics queue and FFmpeg CLI/libx265"]
     fn shared_vulkan_hevc_nv24_gpu_only() {
-        shared_hevc_snapshot(PixelFormat::Nv24);
+        shared_hevc_snapshot(PixelFormat::Nv24, false);
     }
 
     #[cfg(feature = "vulkan")]
     #[test]
     #[ignore = "opt-in: requires Vulkan Video HEVC Range Extensions 10-bit 4:4:4 GPU support, an isolated Qt graphics queue and FFmpeg CLI/libx265"]
     fn shared_vulkan_hevc_p410_gpu_only() {
-        shared_hevc_snapshot(PixelFormat::P410);
+        shared_hevc_snapshot(PixelFormat::P410, false);
     }
 
     #[test]

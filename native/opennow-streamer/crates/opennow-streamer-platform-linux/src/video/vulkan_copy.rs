@@ -54,7 +54,14 @@ pub(super) struct VulkanCopyPool {
     command: vk::CommandBuffer,
     fence: vk::Fence,
     pending: bool,
+    defer_wait: bool,
     failed: bool,
+    #[cfg(test)]
+    completion_error: Option<vk::Result>,
+    #[cfg(test)]
+    submit_error: bool,
+    #[cfg(test)]
+    output_error: bool,
     slots: Vec<Arc<Snapshot>>,
     retirement: SyncSender<Retirement>,
     source: Option<frame::Video>,
@@ -86,15 +93,15 @@ fn retire_resources(
 }
 
 impl VulkanCopyPool {
-    pub(super) fn new(owner: Arc<SharedVulkanDevice>) -> Result<Self> {
-        let result = Self::create_pool(Arc::clone(&owner));
+    pub(super) fn new(owner: Arc<SharedVulkanDevice>, defer_wait: bool) -> Result<Self> {
+        let result = Self::create_pool(Arc::clone(&owner), defer_wait);
         if matches!(&result, Err(Error::DeviceLost { .. })) {
             owner.invalidate();
         }
         result
     }
 
-    fn create_pool(owner: Arc<SharedVulkanDevice>) -> Result<Self> {
+    fn create_pool(owner: Arc<SharedVulkanDevice>, defer_wait: bool) -> Result<Self> {
         let info = owner.info();
         let entry = Arc::new(
             unsafe { ash::Entry::load() }
@@ -163,8 +170,14 @@ impl VulkanCopyPool {
                 if let Ok(resources) = retired.recv() {
                     retire_resources(
                         resources,
-                        |fence| unsafe {
-                            retirement_device.wait_for_fences(&[fence], true, COPY_TIMEOUT_NS)
+                        |fence| {
+                            let result = unsafe {
+                                retirement_device.wait_for_fences(&[fence], true, COPY_TIMEOUT_NS)
+                            };
+                            if result.is_err() {
+                                retirement_owner.invalidate();
+                            }
+                            result
                         },
                         |fence, pool| unsafe {
                             retirement_device.destroy_fence(fence, None);
@@ -198,7 +211,14 @@ impl VulkanCopyPool {
             command,
             fence,
             pending: false,
+            defer_wait,
             failed: false,
+            #[cfg(test)]
+            completion_error: None,
+            #[cfg(test)]
+            submit_error: false,
+            #[cfg(test)]
+            output_error: false,
             slots: Vec::new(),
             retirement,
             source: None,
@@ -232,6 +252,33 @@ impl VulkanCopyPool {
         result
     }
 
+    fn complete_pending(&mut self) -> Result<()> {
+        if !self.pending {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let injected = self.completion_error.take();
+        let result = self.frame_timing.measure(|| {
+            #[cfg(test)]
+            if let Some(error) = injected {
+                return Err(error);
+            }
+            unsafe {
+                self.device
+                    .wait_for_fences(&[self.fence], true, COPY_TIMEOUT_NS)
+            }
+        });
+        if let Err(error) = result {
+            self.failed = true;
+            self.owner.invalidate();
+            // Keep pending/source/slots: even a timeout cannot release GPU owners.
+            return Err(failure("wait for GPU presentation snapshot", error));
+        }
+        self.pending = false;
+        self.source = None;
+        Ok(())
+    }
+
     fn copy_frame(
         &mut self,
         decoded: &frame::Video,
@@ -243,6 +290,9 @@ impl VulkanCopyPool {
                 "Vulkan snapshot device is no longer usable",
             ));
         }
+        // A dropped published snapshot may already have only the pool's Arc.
+        // Complete its write BEFORE validation, pruning, selection or command reset.
+        self.complete_pending()?;
         if decoded.format() != ffmpeg_next::format::Pixel::VULKAN {
             return Err(Error::unavailable(
                 Subsystem::Vulkan,
@@ -391,16 +441,11 @@ impl VulkanCopyPool {
         result?;
         self.pending = true;
         self.source = Some(retained);
-        if let Err(error) = self.frame_timing.measure(|| unsafe {
-            self.device
-                .wait_for_fences(&[self.fence], true, COPY_TIMEOUT_NS)
-        }) {
-            self.failed = true;
-            self.owner.invalidate();
-            return Err(failure("wait for GPU presentation snapshot", error));
+        if !self.defer_wait {
+            self.complete_pending()?;
         }
-        self.pending = false;
-        self.source = None;
+        // Scheduled metadata is published once, only after a successful submit.
+        // Pending source and all slots remain owned through completion/retirement.
         let snapshot = Arc::get_mut(&mut self.slots[index]).expect("unpublished snapshot");
         snapshot.initialized = true;
         snapshot.semaphore_value += 1;
@@ -426,7 +471,7 @@ impl VulkanCopyPool {
                 },
             })
             .collect();
-        let vulkan = unsafe {
+        let mut vulkan = {
             VulkanVideoFrame::new(
                 info.instance,
                 info.physical_device,
@@ -440,7 +485,15 @@ impl VulkanCopyPool {
                 None,
                 slot,
             )
-            .with_completed_gpu_copy()
+        };
+        if !self.defer_wait {
+            vulkan = unsafe { vulkan.with_completed_gpu_copy() };
+        }
+        #[cfg(test)]
+        let format = if self.output_error {
+            StreamFormat { width: 0, ..format }
+        } else {
+            format
         };
         let output = DecodedVideoFrame {
             format,
@@ -593,6 +646,13 @@ impl VulkanCopyPool {
         }
         let slot = &self.slots[index];
         validate_source_formats(&frames.format[..count], slot.pixel_format)?;
+        #[cfg(test)]
+        if self.submit_error {
+            return Err(Error::backend(
+                Subsystem::Vulkan,
+                "injected snapshot submission failure",
+            ));
+        }
         unsafe {
             self.device
                 .reset_fences(&[self.fence])
@@ -1155,5 +1215,212 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn retained_source(pool: &mut VulkanCopyPool) -> frame::Video {
+        let source = frame::Video::new(ffmpeg_next::format::Pixel::NV12, 2, 2);
+        let mut retained = frame::Video::empty();
+        assert_eq!(
+            unsafe { ffi::av_frame_ref(retained.as_mut_ptr(), source.as_ptr()) },
+            0
+        );
+        pool.source = Some(retained);
+        source
+    }
+
+    #[test]
+    #[ignore = "opt-in: requires Vulkan timeline GPU"]
+    fn deferred_pending_completion_precedes_validation_and_retains_on_errors() {
+        // Exercise copy(), not just a state helper: malformed input must not skip
+        // the preceding fence or release pending owners on wait failure.
+        for error in [
+            None,
+            Some(vk::Result::TIMEOUT),
+            Some(vk::Result::ERROR_DEVICE_LOST),
+        ] {
+            let owner = SharedVulkanDevice::create().unwrap();
+            let mut pool = VulkanCopyPool::new(Arc::clone(&owner), true).unwrap();
+            let source = retained_source(&mut pool);
+            let buffer = unsafe { (*source.as_ptr()).buf[0] };
+            pool.pending = true;
+            pool.completion_error = error;
+            let result = pool.copy(&frame::Video::empty(), 0);
+            assert!(result.is_err());
+            assert!(pool.failed && pool.pending && pool.source.is_some());
+            assert!(!owner.supports_format(crate::VideoCodec::H265, PixelFormat::P010, 256, 144));
+            assert_eq!(unsafe { ffi::av_buffer_get_ref_count(buffer) }, 2);
+            // No GPU work was submitted in this injected-error case. Signal its
+            // actual fence before Drop so retirement finishes without orphaning.
+            unsafe {
+                pool.device
+                    .queue_submit(pool.queue, &[], pool.fence)
+                    .unwrap()
+            };
+            drop(pool);
+            for _ in 0..100 {
+                if unsafe { ffi::av_buffer_get_ref_count(buffer) } == 1 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(unsafe { ffi::av_buffer_get_ref_count(buffer) }, 1);
+        }
+        let owner = SharedVulkanDevice::create().unwrap();
+        let mut pool = VulkanCopyPool::new(owner, true).unwrap();
+        let source = retained_source(&mut pool);
+        pool.pending = true;
+        unsafe {
+            pool.device
+                .queue_submit(pool.queue, &[], pool.fence)
+                .unwrap()
+        };
+        let error = pool.copy(&frame::Video::empty(), 0).unwrap_err();
+        assert!(error.to_string().contains("not a Vulkan frame"));
+        assert!(!pool.pending && pool.source.is_none() && !pool.failed);
+        assert_eq!(
+            unsafe { ffi::av_buffer_get_ref_count((*source.as_ptr()).buf[0]) },
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "opt-in: requires Vulkan Video Main10 GPU and FFmpeg CLI/libx265"]
+    fn deferred_copy_outputs_retain_slots_and_gate_format_pruning_and_failures() {
+        let owner = SharedVulkanDevice::create().unwrap();
+        let raw = super::super::ffmpeg::tests::shared_hevc_source(Arc::clone(&owner), 256, 144);
+        let changed = super::super::ffmpeg::tests::shared_hevc_source(Arc::clone(&owner), 128, 72);
+        let mut pool = VulkanCopyPool::new(Arc::clone(&owner), true).unwrap();
+        let first = pool.copy(&raw, 1).unwrap();
+        assert!(pool.pending && pool.source.is_some());
+        assert!(!first.vulkan.as_ref().unwrap().completed_gpu_copy());
+        let original_images = first.vulkan.as_ref().unwrap().images.clone();
+        let second = pool.copy(&raw, 2).unwrap();
+        assert_eq!(pool.slots.len(), 2);
+        assert_ne!(
+            second.vulkan.as_ref().unwrap().images[0].image,
+            original_images[0].image
+        );
+        let second_image = second.vulkan.as_ref().unwrap().images[0].image;
+        drop(second);
+        let third = pool.copy(&raw, 3).unwrap();
+        assert_eq!(third.vulkan.as_ref().unwrap().images[0].image, second_image);
+        assert_eq!(
+            first.vulkan.as_ref().unwrap().images[0].semaphore_value,
+            original_images[0].semaphore_value
+        );
+        drop(third);
+        // Force the predecessor failure while a format change would prune the
+        // now-unowned slot. Real production ordering must leave BOTH intact.
+        pool.completion_error = Some(vk::Result::TIMEOUT);
+        assert!(pool.copy(&changed, 4).is_err());
+        assert_eq!(pool.slots.len(), 2);
+        assert!(pool.pending && pool.source.is_some());
+        // Wait the genuinely submitted predecessor before test recovery. Normal
+        // playback never recovers an invalidated pool this way.
+        unsafe {
+            pool.device
+                .wait_for_fences(&[pool.fence], true, COPY_TIMEOUT_NS)
+                .unwrap()
+        };
+        drop(pool);
+        drop(first);
+
+        let owner = SharedVulkanDevice::create().unwrap();
+        let raw = super::super::ffmpeg::tests::shared_hevc_source(Arc::clone(&owner), 256, 144);
+        let changed = super::super::ffmpeg::tests::shared_hevc_source(Arc::clone(&owner), 128, 72);
+        let mut pool = VulkanCopyPool::new(owner, true).unwrap();
+        drop(pool.copy(&raw, 1).unwrap());
+        let output = pool.copy(&changed, 2).unwrap();
+        assert_eq!(pool.slots.len(), 1); // completed predecessor pruned safely
+        assert_eq!(output.format.width, 128);
+        pool.complete_pending().unwrap();
+        pool.submit_error = true;
+        assert!(pool.copy(&changed, 3).is_err());
+        assert!(!pool.pending && pool.source.is_none());
+        pool.submit_error = false;
+        pool.output_error = true;
+        let source_buffer = unsafe { (*changed.as_ptr()).buf[0] };
+        let original_refs = unsafe { ffi::av_buffer_get_ref_count(source_buffer) };
+        assert!(pool.copy(&changed, 4).is_err());
+        assert!(pool.pending && pool.source.is_some()); // post-submit failure
+        assert_eq!(
+            unsafe { ffi::av_buffer_get_ref_count(source_buffer) },
+            original_refs + 1
+        );
+        let pending_slot = Arc::downgrade(pool.slots.last().unwrap());
+        drop(pool); // pending last frame handed to production retirement
+        let producer = crate::LinuxGpuFrameProducer::new(3).unwrap();
+        producer.frame(output).unwrap(); // retained old output survives destruction
+        for _ in 0..100 {
+            if pending_slot.upgrade().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            pending_slot.upgrade().is_none(),
+            "retired pending slot must not be orphaned"
+        );
+        assert_eq!(
+            unsafe { ffi::av_buffer_get_ref_count(source_buffer) },
+            original_refs
+        );
+    }
+
+    #[test]
+    #[ignore = "opt-in: requires Vulkan Video Main10 GPU and FFmpeg CLI/libx265"]
+    fn deferred_unmarked_snapshot_consumer_waits_for_unsignaled_timeline() {
+        let owner = SharedVulkanDevice::create().unwrap();
+        let raw = super::super::ffmpeg::tests::shared_hevc_source(Arc::clone(&owner), 256, 144);
+        let mut pool = VulkanCopyPool::new(owner, true).unwrap();
+        let mut output = pool.copy(&raw, 1).unwrap();
+        pool.complete_pending().unwrap();
+        // Exact production snapshot constructor supplies context=0/callbacks=None.
+        // Replace only its timeline with an independently controlled unsignaled
+        // GPU timeline to prove the real publisher honors readiness, not the flag.
+        let mut kind =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        let semaphore = unsafe {
+            pool.device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+                    None,
+                )
+                .unwrap()
+        };
+        let vulkan = Arc::get_mut(output.vulkan.as_mut().unwrap()).unwrap();
+        assert!(!vulkan.completed_gpu_copy());
+        for image in &mut vulkan.images {
+            image.semaphore = semaphore.as_raw();
+            image.semaphore_value = 1;
+        }
+        let (started, start) = sync_channel(1);
+        let (sent, done) = sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let producer = crate::LinuxGpuFrameProducer::new(3).unwrap();
+            started.send(()).unwrap();
+            sent.send(producer.frame(output)).unwrap();
+        });
+        start.recv().unwrap();
+        assert!(matches!(
+            done.recv_timeout(std::time::Duration::from_millis(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        unsafe {
+            pool.device
+                .signal_semaphore(
+                    &vk::SemaphoreSignalInfo::default()
+                        .semaphore(semaphore)
+                        .value(1),
+                )
+                .unwrap()
+        };
+        let published = done
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        drop(published);
+        unsafe { pool.device.destroy_semaphore(semaphore, None) };
     }
 }
