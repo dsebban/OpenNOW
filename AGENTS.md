@@ -207,6 +207,8 @@ Real GFN playback is validated on the user's NucBox, where the saved NVIDIA cred
 - One operator at a time owns the GUI and the account session. Ask before restarting the client, starting a stream, or changing region; no VPN, router, Wi-Fi, SQM, or rmem changes without explicit approval.
 - Baseline command and results: `scripts/nucbox-latency-baseline.py` (mirror of the box's `tools/latency-baseline.py`) and `docs/nucbox-latency-baseline-20261008.md`. Compare candidates only within one cloud session against matched baseline controls.
 - Credentials, raw captures, and logs stay out of Git.
+- Tasks the coordinator cannot perform may be delegated to a Codex agent on ChimeraOS via Herdr (`~/.local/bin/herdr`); discover its skill with `ssh chimeraos '~/.local/bin/herdr --skill'`. Use explicit remote session/pane/agent identifiers and preserve user focus. Meet the actual Herdr-managed-pane prerequisite; never spoof `HERDR_ENV` or control a focused unrelated session.
+- The user explicitly authorizes foreground Cua Driver delivery on ChimeraOS, including normal Qt quit confirmations; prefer background delivery when supported. This exception does not apply to the local desktop. Delegation and delivery do not relax the one-operator, credential, networking, source-deployment, or approval boundaries above; existing user authorization may be reused within its scope.
 
 ## Build and Checks
 
