@@ -199,16 +199,16 @@ Crowdin and should change only through Crowdin synchronization pull requests.
 
 ## NucBox (ChimeraOS) live testing
 
-Real GFN playback is validated on the user's NucBox, where the saved NVIDIA credentials live. Access: `ssh chimeraos` (user `gamer`). Use the skill `.agents/skills/verify-gfn-experiments/SKILL.md` before launching, driving, or measuring the client there; its `features/` map covers playback, live measurement, network comparison, and `latency-baseline.md`.
+Real GFN playback is validated on the user's NucBox, where the saved NVIDIA credentials live. This checkout is on that NucBox: development, build, and live testing all happen locally on ChimeraOS (user `gamer`) at `~/dev/gfn-client-research`. Agents work directly on the box — there is no SSH hop. (From another host the machine is reachable as `ssh chimeraos`.) Use the skill `.agents/skills/verify-gfn-experiments/SKILL.md` before launching, driving, or measuring the client; its `features/` map covers playback, live measurement, network comparison, and `latency-baseline.md`.
 
-- Remote layout: `~/dev/gfn-client-research` is the research workspace (`tools/`, `research/`, private `.runtime/`). `vendor/OpenNOW` is a clone of this repo's `origin`; `build/opennow-qt` is its Release build.
-- Edit and commit locally, then push the branch (ask first). On the NucBox: `cd ~/dev/gfn-client-research/vendor/OpenNOW && git pull --ff-only`, then `tools/build-native.sh` (never build or test during a scored window). Do not edit `vendor/OpenNOW` on the box.
+- Local layout: `~/dev/gfn-client-research` is the research workspace (`tools/`, `research/`, private `.runtime/`). This repository is its `vendor/OpenNOW` working checkout; `build/opennow-qt` is the Release build used for live trials.
+- Edit, commit, and build directly in this checkout. Build the deployed client with `tools/build-native.sh`; never build or test during a scored window. Push branches to `origin` only when syncing is required (ask first).
 - Launch only via `tools/run-live-trial.sh baseline|poll1|continuous|vaapi|basic|idle0` (telemetry) or `tools/run-native.sh` (plain), through Cua Driver. Close the old client through its GUI flow and confirm the Qt and core PIDs exited first. Never kill by process name.
 - One operator at a time owns the GUI and the account session. Ask before restarting the client, starting a stream, or changing region; no VPN, router, Wi-Fi, SQM, or rmem changes without explicit approval.
-- Baseline command and results: `scripts/nucbox-latency-baseline.py` (mirror of the box's `tools/latency-baseline.py`) and `docs/nucbox-latency-baseline-20261008.md`. Compare candidates only within one cloud session against matched baseline controls.
+- Baseline command and results: `scripts/nucbox-latency-baseline.py` (mirror of the workspace `tools/latency-baseline.py`) and `docs/nucbox-latency-baseline-20261008.md`. Compare candidates only within one cloud session against matched baseline controls.
 - Credentials, raw captures, and logs stay out of Git.
-- Tasks the coordinator cannot perform may be delegated to a Codex agent on ChimeraOS via Herdr (`~/.local/bin/herdr`); discover its skill with `ssh chimeraos '~/.local/bin/herdr --skill'`. Use explicit remote session/pane/agent identifiers and preserve user focus. Meet the actual Herdr-managed-pane prerequisite; never spoof `HERDR_ENV` or control a focused unrelated session.
-- The user explicitly authorizes foreground Cua Driver delivery on ChimeraOS, including normal Qt quit confirmations; prefer background delivery when supported. This exception does not apply to the local desktop. Delegation and delivery do not relax the one-operator, credential, networking, source-deployment, or approval boundaries above; existing user authorization may be reused within its scope.
+- Tasks may be delegated to a Codex agent on this machine via Herdr (`~/.local/bin/herdr`); discover its skill with `~/.local/bin/herdr --skill`. Use explicit session/pane/agent identifiers and preserve user focus. Meet the actual Herdr-managed-pane prerequisite; never spoof `HERDR_ENV` or control a focused unrelated session.
+- The user explicitly authorizes foreground Cua Driver delivery on this machine, including normal Qt quit confirmations; prefer background delivery when supported. Delegation and delivery do not relax the one-operator, credential, networking, source-deployment, or approval boundaries above; existing user authorization may be reused within its scope.
 
 ## Build and Checks
 
