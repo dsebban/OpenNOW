@@ -14,6 +14,121 @@ use crate::{
     StreamFormat, Subsystem, VideoCodec,
 };
 
+fn frame_stage_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("OPENNOW_FRAME_STAGE_LOG").map_or(false, |value| value != "0")
+    })
+}
+
+fn decoder_reopen_timing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("OPENNOW_VULKAN_FRAME_TIMING").is_ok_and(|value| value == "1")
+    })
+}
+
+fn log_decoder_reopen(
+    started: Option<Instant>,
+    open_us: u128,
+    generation: u64,
+    reason: &str,
+    success: bool,
+) {
+    let Some(started) = started else { return };
+    let duration_us = started.elapsed().as_micros();
+    let wall_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_micros());
+    eprintln!(
+        "type=decoder-reopen-timing pid={} generation={generation} reason={reason} durationUs={duration_us} openUs={open_us} wallUs={wall_us} success={success}",
+        std::process::id()
+    );
+}
+
+fn log_frame_stage(stage: &str, timestamp_us: u64) {
+    let wall_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_micros());
+    eprintln!("frame-stage-log stage={stage} pts_us={timestamp_us} wall_us={wall_us}");
+}
+
+fn monotonic_us() -> i64 {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_micros() as i64
+}
+
+// PTS-anchored submission gate. The transport hands the worker bursts of
+// frames (Wi-Fi/assembly clumping); the worker then drains them at the
+// serialized decode service rate, so decode completions — the real
+// frame-availability clock, since the published timeline semaphore signals
+// on GPU completion — inherit amplified jitter. Holding each frame until
+// its PTS slot before submission spaces completions uniformly instead.
+// Frames only wait when they are early relative to the observed arrival
+// lag, and every hold is bounded, so a pathological deadline can never
+// stall decode.
+struct SubmitPacer {
+    cushion_us: i64,
+    max_hold_us: i64,
+    lag_ref_us: Option<f64>,
+    last_pts_us: Option<u64>,
+}
+
+impl SubmitPacer {
+    fn from_env() -> Option<Self> {
+        let enabled = std::env::var("OPENNOW_SUBMIT_PACED").map_or(false, |value| value != "0");
+        if !enabled {
+            return None;
+        }
+        let cushion_us = std::env::var("OPENNOW_SUBMIT_CUSHION_US")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(2_000);
+        let max_hold_us = std::env::var("OPENNOW_SUBMIT_MAXHOLD_US")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(24_000);
+        Some(Self {
+            cushion_us,
+            max_hold_us,
+            lag_ref_us: None,
+            last_pts_us: None,
+        })
+    }
+
+    /// Blocks until the frame's PTS slot. The lag anchor is measured before
+    /// sleeping so the gate's own delay never feeds the anchor.
+    fn gate(&mut self, frame: &EncodedVideoFrame) {
+        let now = monotonic_us();
+        let pts = frame.timestamp_us as i64;
+        if self
+            .last_pts_us
+            .is_some_and(|last| frame.timestamp_us <= last)
+        {
+            // PTS moved backwards (reconnect, reconfigure, seek): the old
+            // anchor is meaningless, re-anchor on this frame.
+            self.lag_ref_us = None;
+        }
+        self.last_pts_us = Some(frame.timestamp_us);
+        let lag = now - pts;
+        if let Some(reference) = self.lag_ref_us {
+            // A forward PTS jump would park the frame far in the future.
+            if reference as i64 + self.cushion_us - lag > 50_000 {
+                self.lag_ref_us = None;
+            }
+        }
+        self.lag_ref_us = Some(match self.lag_ref_us {
+            Some(reference) => reference * 0.98 + lag as f64 * 0.02,
+            None => lag as f64,
+        });
+        let due = pts + self.lag_ref_us.unwrap_or(0.0) as i64 + self.cushion_us;
+        let wait = (due - now).min(self.max_hold_us);
+        if wait > 0 {
+            std::thread::sleep(Duration::from_micros(wait as u64));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderBackend {
     Vulkan,
@@ -127,6 +242,7 @@ impl SessionConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushOutcome {
+    /// The submitted item was retained, including a recovery IDR replacing stale decode work.
     Queued,
     DroppedOldest,
     Paused,
@@ -342,13 +458,18 @@ impl LinuxSession {
             .video_submit
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        queue_video_command(
+        let timestamp_us = frame.timestamp_us;
+        let outcome = queue_video_command(
             &self.video_commands,
             &self.events,
             &self.video_generation,
             &self.video_needs_keyframe,
             frame,
-        )
+        );
+        if outcome.is_ok() && frame_stage_log_enabled() {
+            log_frame_stage("enqueue", timestamp_us);
+        }
+        outcome
     }
 
     pub fn submit_audio(&self, packet: AudioPacket) -> Result<PushOutcome> {
@@ -494,9 +615,12 @@ fn queue_video_command(
             }
             QueuePush::DroppedOldest => {
                 needs_keyframe.store(false, Ordering::Release);
+                Ok(PushOutcome::Queued)
+            }
+            QueuePush::Full => {
+                emit(events, BackendEvent::NeedKeyframe);
                 Ok(PushOutcome::DroppedOldest)
             }
-            QueuePush::Full => Ok(PushOutcome::DroppedOldest),
             QueuePush::Closed => Err(Error::QueueClosed),
         };
     }
@@ -529,8 +653,9 @@ fn queue_video_command(
                     QueuePush::Closed => return Err(Error::QueueClosed),
                     QueuePush::Added | QueuePush::DroppedOldest => {
                         needs_keyframe.store(false, Ordering::Release);
+                        return Ok(PushOutcome::Queued);
                     }
-                    QueuePush::Full => {}
+                    QueuePush::Full => emit(events, BackendEvent::NeedKeyframe),
                 }
             } else {
                 emit(events, BackendEvent::NeedKeyframe);
@@ -589,6 +714,10 @@ fn run_video_worker(
             return;
         }
     };
+    let mut identity = crate::recovery_identity::Probe::from_env();
+    if let Some(probe) = identity.as_mut() {
+        probe.opened("initial");
+    }
     if !publish_video_readiness(&state, &events, backend, &startup) {
         return;
     }
@@ -598,6 +727,7 @@ fn run_video_worker(
     // backend fallback and a large visible hitch.
     let mut need_keyframe = true;
     let mut reference_recovery = ReferenceRecovery::default();
+    let mut submit_pacer = SubmitPacer::from_env();
     emit(&events, BackendEvent::NeedKeyframe);
 
     let mut active_format = config.stream_format;
@@ -616,6 +746,7 @@ fn run_video_worker(
                 if generation < active_generation {
                     continue;
                 }
+                let reopen_started = decoder_reopen_timing_enabled().then(Instant::now);
                 transition_state(&state, LifecycleState::Reconfiguring, &events);
                 finish_decoder_drain(
                     flush_decoder(&mut decoder),
@@ -626,7 +757,10 @@ fn run_video_worker(
                 );
                 decoded.clear();
                 decode_timings.clear();
-                match open_preferred_decoder(&config, format) {
+                let open_started = reopen_started.map(|_| Instant::now());
+                let reopened = open_preferred_decoder(&config, format);
+                let open_us = open_started.map_or(0, |started| started.elapsed().as_micros());
+                match reopened {
                     Ok((new_backend, new_decoder)) => {
                         if new_backend != backend {
                             emit(
@@ -640,14 +774,19 @@ fn run_video_worker(
                         }
                         backend = new_backend;
                         decoder = new_decoder;
+                        if let Some(probe) = identity.as_mut() {
+                            probe.opened("format");
+                        }
                         active_format = format;
                         active_generation = generation;
                         need_keyframe = true;
                         emit(&events, BackendEvent::FormatChanged(format));
                         emit(&events, BackendEvent::NeedKeyframe);
                         transition_state(&state, LifecycleState::Running, &events);
+                        log_decoder_reopen(reopen_started, open_us, generation, "format", true);
                     }
                     Err(error) => {
+                        log_decoder_reopen(reopen_started, open_us, generation, "format", false);
                         report_worker_error(&state, &events, error);
                         return;
                     }
@@ -663,9 +802,13 @@ fn run_video_worker(
                     continue;
                 }
                 if reset || generation > active_generation {
+                    let reopen_started = decoder_reopen_timing_enabled().then(Instant::now);
                     decoded.clear();
                     decode_timings.clear();
-                    match open_preferred_decoder(&config, active_format) {
+                    let open_started = reopen_started.map(|_| Instant::now());
+                    let reopened = open_preferred_decoder(&config, active_format);
+                    let open_us = open_started.map_or(0, |started| started.elapsed().as_micros());
+                    match reopened {
                         Ok((new_backend, new_decoder)) => {
                             if new_backend != backend {
                                 emit(
@@ -679,14 +822,19 @@ fn run_video_worker(
                             }
                             backend = new_backend;
                             decoder = new_decoder;
+                            if let Some(probe) = identity.as_mut() {
+                                probe.opened("queue");
+                            }
                             active_generation = generation;
                         }
                         Err(error) => {
+                            log_decoder_reopen(reopen_started, open_us, generation, "queue", false);
                             report_worker_error(&state, &events, error);
                             return;
                         }
                     }
                     need_keyframe = true;
+                    log_decoder_reopen(reopen_started, open_us, generation, "queue", true);
                 }
                 if need_keyframe && !frame.keyframe {
                     continue;
@@ -696,7 +844,16 @@ fn run_video_worker(
             None => None,
         };
         if let Some(frame) = frame.as_ref() {
+            if let Some(pacer) = submit_pacer.as_mut() {
+                pacer.gate(frame);
+            }
+            if frame_stage_log_enabled() {
+                log_frame_stage("submit", frame.timestamp_us);
+            }
             decode_timings.record_submission(frame.timestamp_us);
+            if let Some(probe) = identity.as_mut() {
+                probe.submitted(frame.timestamp_us, frame.keyframe);
+            }
         }
         let call_started = Instant::now();
         let result = if let Some(frame) = frame.as_ref() {
@@ -718,6 +875,11 @@ fn run_video_worker(
                     emit(&events, BackendEvent::FormatChanged(format));
                 }
                 record_decoded_outputs(&decode_timings, &frames);
+                if let Some(probe) = identity.as_mut() {
+                    for output in &frames {
+                        probe.decoded(output.timestamp_us);
+                    }
+                }
                 decode_timings.record_call(call_duration, !frames.is_empty());
                 enqueue_frames(&decoded, &events, frames);
             }
@@ -729,7 +891,12 @@ fn run_video_worker(
                 }
                 drop(decoder);
                 match open_decoder(&config, active_format, backend) {
-                    Ok(new_decoder) => decoder = new_decoder,
+                    Ok(new_decoder) => {
+                        decoder = new_decoder;
+                        if let Some(probe) = identity.as_mut() {
+                            probe.opened("reference_loss");
+                        }
+                    }
                     Err(error) => {
                         report_worker_error(&state, &events, error);
                         return;
@@ -741,6 +908,9 @@ fn run_video_worker(
             }
             Err(error) => match open_fallback_decoder(&config, active_format, backend) {
                 Ok((new_backend, mut new_decoder)) => {
+                    if let Some(probe) = identity.as_mut() {
+                        probe.opened("fallback");
+                    }
                     let reason = error.to_string();
                     emit(
                         &events,
@@ -754,6 +924,9 @@ fn run_video_worker(
                     decode_timings.clear();
                     if let Some(frame) = frame.as_ref().filter(|frame| frame.keyframe) {
                         decode_timings.record_submission(frame.timestamp_us);
+                        if let Some(probe) = identity.as_mut() {
+                            probe.submitted(frame.timestamp_us, true);
+                        }
                         let retry_started = Instant::now();
                         match decode_frame(&mut new_decoder, frame) {
                             Ok(frames) => {
@@ -762,6 +935,11 @@ fn run_video_worker(
                                     emit(&events, BackendEvent::FormatChanged(format));
                                 }
                                 record_decoded_outputs(&decode_timings, &frames);
+                                if let Some(probe) = identity.as_mut() {
+                                    for output in &frames {
+                                        probe.decoded(output.timestamp_us);
+                                    }
+                                }
                                 decode_timings
                                     .record_call(retry_started.elapsed(), !frames.is_empty());
                                 enqueue_frames(&decoded, &events, frames);
@@ -1328,6 +1506,7 @@ fn enqueue_frames(
     frames: Vec<DecodedVideoFrame>,
 ) {
     for frame in frames {
+        let timestamp_us = frame.timestamp_us;
         if queue.push_latest(frame) == QueuePush::DroppedOldest {
             emit(
                 events,
@@ -1335,6 +1514,9 @@ fn enqueue_frames(
                     media: "decoded-video",
                 },
             );
+        }
+        if frame_stage_log_enabled() {
+            log_frame_stage("decoded", timestamp_us);
         }
     }
 }
@@ -1720,7 +1902,7 @@ mod tests {
                 frame(4, true),
             )
             .unwrap(),
-            PushOutcome::DroppedOldest
+            PushOutcome::Queued
         );
         assert!(!needs_keyframe.load(Ordering::Acquire));
         assert_eq!(
@@ -1756,6 +1938,80 @@ mod tests {
         assert!(!frame.keyframe);
         assert!(!reset);
         assert_eq!(inter_generation, keyframe_generation);
+    }
+
+    #[test]
+    fn overflow_boundary_reports_a_retained_idr_as_queued() {
+        let commands = BoundedQueue::new(1);
+        let events = Arc::new(BoundedQueue::new(8));
+        let generation = AtomicU64::new(0);
+        let needs_keyframe = AtomicBool::new(false);
+        let frame = |keyframe| EncodedVideoFrame::new(vec![1], 0, keyframe).unwrap();
+        assert_eq!(
+            queue_video_command(
+                &commands,
+                &events,
+                &generation,
+                &needs_keyframe,
+                frame(false)
+            )
+            .unwrap(),
+            PushOutcome::Queued
+        );
+        assert_eq!(
+            queue_video_command(
+                &commands,
+                &events,
+                &generation,
+                &needs_keyframe,
+                frame(true)
+            )
+            .unwrap(),
+            PushOutcome::Queued
+        );
+        assert!(!needs_keyframe.load(Ordering::Acquire));
+        assert!(
+            matches!(commands.wait_pop(Duration::ZERO), QueuePop::Item(VideoCommand::Decode { frame, reset: true, .. }) if frame.keyframe)
+        );
+        while let QueuePop::Item(event) = events.wait_pop(Duration::ZERO) {
+            assert!(
+                !matches!(event, BackendEvent::NeedKeyframe),
+                "a retained IDR must not trigger another request"
+            );
+        }
+    }
+
+    #[test]
+    fn control_only_overflow_does_not_report_a_rejected_idr_as_queued() {
+        for recovering in [false, true] {
+            let commands = BoundedQueue::new(1);
+            let events = Arc::new(BoundedQueue::new(8));
+            let generation = AtomicU64::new(0);
+            let needs_keyframe = AtomicBool::new(recovering);
+            commands.push(VideoCommand::Reconfigure {
+                format: StreamFormat::video_default(1920, 1080).unwrap(),
+                generation: 0,
+            });
+            let frame = EncodedVideoFrame::new(vec![1], 0, true).unwrap();
+            assert_eq!(
+                queue_video_command(&commands, &events, &generation, &needs_keyframe, frame)
+                    .unwrap(),
+                PushOutcome::DroppedOldest
+            );
+            assert!(needs_keyframe.load(Ordering::Acquire));
+            assert!(matches!(
+                commands.wait_pop(Duration::ZERO),
+                QueuePop::Item(VideoCommand::Reconfigure { .. })
+            ));
+            let mut requested = false;
+            while let QueuePop::Item(event) = events.wait_pop(Duration::ZERO) {
+                requested |= matches!(event, BackendEvent::NeedKeyframe);
+            }
+            assert!(
+                requested,
+                "an IDR blocked by control work still needs recovery"
+            );
+        }
     }
 
     const VALID_OPUS_PACKET: [u8; 1] = [0x08];

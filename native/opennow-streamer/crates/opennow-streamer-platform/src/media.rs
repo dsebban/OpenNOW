@@ -3033,12 +3033,7 @@ fn run_linux_video(shared: Arc<SharedPipeline>, host_commands: Sender<HostComman
                 }
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::DroppedOldest) => {
-                if frame.keyframe {
-                    shared.video_desynced.store(false, Ordering::Release);
-                    shared.keyframe_requested.store(false, Ordering::Release);
-                } else {
-                    shared.video_desynced.store(true, Ordering::Release);
-                }
+                shared.video_desynced.store(true, Ordering::Release);
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
             Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
@@ -3212,6 +3207,141 @@ fn embedded_linux_publish_poll_interval(value: Option<&str>) -> std::time::Durat
     })
 }
 
+// Monotonic microseconds for pacing arithmetic. The base is arbitrary — only
+// differences against it (lag = now - pts) are used, so an Instant-derived
+// clock is both correct and immune to civil-time adjustments.
+#[cfg(target_os = "linux")]
+fn monotonic_us() -> i64 {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_micros() as i64
+}
+
+// De-jittered frame publication. Decoded frames arrive at the Qt-facing
+// publisher in bursts (transport batching plus decode-stage variance), so an
+// immediate republish passes upstream jitter straight to the render thread.
+// This pacer instead holds the newest decoded frame until its PTS-anchored
+// deadline: pts + lag_ref + cushion, where lag_ref is a slow EMA of the
+// observed (decoded_wall - pts) offset. Frames arriving later than the
+// deadline publish immediately, so the cushion only delays frames that
+// arrive early relative to the current estimate; a forward PTS jump or a
+// burst far ahead of schedule is clamped to a bounded hold.
+#[cfg(target_os = "linux")]
+struct EmbeddedPublishPacer {
+    cushion_us: i64,
+    min_gap_us: u64,
+    grid_us: i64,
+    lag_ref_us: Option<f64>,
+    last_publish_at: Option<Instant>,
+    last_pts_us: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl EmbeddedPublishPacer {
+    fn from_env() -> Option<Self> {
+        let enabled = std::env::var("OPENNOW_EMBEDDED_PUBLISH_PACED")
+            .map_or(false, |value| value != "0");
+        if !enabled {
+            return None;
+        }
+        let cushion_us = std::env::var("OPENNOW_EMBEDDED_PUBLISH_CUSHION_US")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(6_000);
+        let min_gap_us = std::env::var("OPENNOW_EMBEDDED_PUBLISH_MINGAP_US")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10_000);
+        // Grid snapping to a fixed wall-clock period is disabled by default:
+        // without knowing the real vsync phase, a 10 ms grid lets 10 ms-spaced
+        // publish pairs collapse into one refresh window. Kept as an env knob
+        // for phase experiments; <=1 means release exactly at the deadline.
+        let grid_us = std::env::var("OPENNOW_EMBEDDED_PUBLISH_GRID_US")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(1);
+        Some(Self {
+            cushion_us,
+            min_gap_us,
+            grid_us,
+            lag_ref_us: None,
+            last_publish_at: None,
+            last_pts_us: None,
+        })
+    }
+
+    fn observe(&mut self, frame: &opennow_streamer_platform_linux::DecodedVideoFrame) {
+        let pts = frame.timestamp_us as i64;
+        if self
+            .last_pts_us
+            .is_some_and(|last| frame.timestamp_us <= last)
+        {
+            // PTS jumped backwards (reconnect, reconfigure, seek): the old
+            // anchor is meaningless, re-anchor on this frame.
+            self.lag_ref_us = None;
+        }
+        self.last_pts_us = Some(frame.timestamp_us);
+        let lag = monotonic_us() - pts;
+        // A forward PTS jump would park the frame far in the future; re-anchor
+        // so the deadline stays in the present.
+        if let Some(reference) = self.lag_ref_us {
+            if reference as i64 + self.cushion_us - lag > 50_000 {
+                self.lag_ref_us = None;
+            }
+        }
+        self.lag_ref_us = Some(match self.lag_ref_us {
+            // ~50 frame time constant keeps the anchor stable through bursts
+            // while still tracking real transport drift.
+            Some(reference) => reference * 0.98 + lag as f64 * 0.02,
+            None => lag as f64,
+        });
+    }
+
+    /// Monotonic instant at which the frame may be released: its PTS deadline
+    /// snapped up to the next grid point. Quantizing release times to a fixed
+    /// 10 ms grid keeps the mapping from publish to display refresh
+    /// deterministic, so residual sub-frame jitter cannot flip a frame onto a
+    /// later refresh. None means the frame is releasable immediately.
+    fn release_at(&self, frame: &opennow_streamer_platform_linux::DecodedVideoFrame) -> Option<i64> {
+        let lag_ref = self.lag_ref_us?;
+        let deadline = frame.timestamp_us as i64 + lag_ref as i64 + self.cushion_us;
+        let grid = self.grid_us.max(1);
+        Some((deadline + grid - 1).div_euclid(grid) * grid)
+    }
+
+    fn due(&self, frame: &opennow_streamer_platform_linux::DecodedVideoFrame) -> bool {
+        let Some(release) = self.release_at(frame) else {
+            return true;
+        };
+        if monotonic_us() < release {
+            return false;
+        }
+        if let Some(last) = self.last_publish_at {
+            if last.elapsed().as_micros() < u128::from(self.min_gap_us) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn mark_published(&mut self) {
+        self.last_publish_at = Some(Instant::now());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn log_frame_stage_publish(timestamp_us: u64) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var("OPENNOW_FRAME_STAGE_LOG").map_or(false, |value| value != "0")
+    }) {
+        return;
+    }
+    let wall_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_micros());
+    eprintln!("frame-stage-log stage=publish pts_us={timestamp_us} wall_us={wall_us}");
+}
+
 #[cfg(target_os = "linux")]
 fn run_embedded_linux_monitor(
     shared: Arc<SharedPipeline>,
@@ -3226,6 +3356,12 @@ fn run_embedded_linux_monitor(
             .ok()
             .as_deref(),
     );
+    let mut pacer = EmbeddedPublishPacer::from_env();
+    // PTS-ordered hold queue for the paced path (arrival instant, frame).
+    let mut pending: std::collections::VecDeque<(
+        Instant,
+        opennow_streamer_platform_linux::DecodedVideoFrame,
+    )> = std::collections::VecDeque::new();
     let mut playback_started = false;
     let mut last_decode_timings_report = Instant::now();
     let mut reported_color = None;
@@ -3278,7 +3414,9 @@ fn run_embedded_linux_monitor(
                     }));
             }
         }
-        if !shared.paused.load(Ordering::Acquire) {
+        if shared.paused.load(Ordering::Acquire) {
+            pending.clear();
+        } else {
             if let Some((decoded, skipped)) = frame {
                 if skipped > 0 {
                     let _ = shared.feedback.send(MediaFeedback::QueueDropped {
@@ -3286,8 +3424,47 @@ fn run_embedded_linux_monitor(
                         count: skipped,
                     });
                 }
-                if let Some(lease) = publisher.context() {
-                    match producer
+                if let Some(pacer) = pacer.as_mut() {
+                    pacer.observe(&decoded);
+                }
+                pending.push_back((Instant::now(), decoded));
+                if pending.len() > 4 {
+                    // Bounded catch-up: the oldest held frame is the stalest.
+                    pending.pop_front();
+                    let _ = shared.feedback.send(MediaFeedback::QueueDropped {
+                        media: "pacer-pending",
+                        count: 1,
+                    });
+                }
+            }
+            if let Some(lease) = publisher.context() {
+                // Publish the newest frame whose deadline has passed and
+                // collapse every older frame with it: stale backlog is never
+                // replayed. A held frame is always released once it has
+                // waited beyond any justifiable cushion, so a pathological
+                // deadline can never stall publication.
+                let to_publish = match pacer.as_ref() {
+                    Some(pacer) => {
+                        let index = pending.iter().rposition(|(held_since, frame)| {
+                            held_since.elapsed().as_micros() > 24_000u128 || pacer.due(frame)
+                        });
+                        index.and_then(|index| {
+                            let stale = index;
+                            pending.drain(..index);
+                            if stale > 0 {
+                                let _ = shared.feedback.send(MediaFeedback::QueueDropped {
+                                    media: "pacer-stale",
+                                    count: stale,
+                                });
+                            }
+                            pending.pop_front().map(|(_, frame)| frame)
+                        })
+                    }
+                    None => pending.pop_front().map(|(_, frame)| frame),
+                };
+                if let Some(decoded) = to_publish {
+                    let decoded_timestamp_us = decoded.timestamp_us;
+                    let published = match producer
                         .frame(decoded)
                         .map_err(|error| error.to_string())
                         .and_then(|frame| {
@@ -3304,10 +3481,21 @@ fn run_embedded_linux_monitor(
                             let _ = shared.feedback.send(MediaFeedback::PlaybackStarted {
                                 backend: backend_label,
                             });
+                            log_frame_stage_publish(decoded_timestamp_us);
+                            true
                         }
-                        Ok(_) => {}
+                        Ok(_) => {
+                            log_frame_stage_publish(decoded_timestamp_us);
+                            true
+                        }
                         Err(message) => {
                             let _ = shared.feedback.send(MediaFeedback::OutputError { message });
+                            false
+                        }
+                    };
+                    if published {
+                        if let Some(pacer) = pacer.as_mut() {
+                            pacer.mark_published();
                         }
                     }
                 }
@@ -3402,7 +3590,23 @@ fn run_embedded_linux_monitor(
                 | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
-        thread::sleep(publish_poll_interval);
+        let mut sleep_for = publish_poll_interval;
+        if let Some(pacer) = pacer.as_ref() {
+            // Wake at the next release instant rather than on the fixed poll
+            // so publishes land on the grid instead of smearing across the
+            // poll interval.
+            if let Some(release) = pending
+                .iter()
+                .filter_map(|(_, frame)| pacer.release_at(frame))
+                .min()
+            {
+                let wait = release - monotonic_us();
+                if wait > 0 && wait < publish_poll_interval.as_micros() as i64 {
+                    sleep_for = Duration::from_micros(wait as u64);
+                }
+            }
+        }
+        thread::sleep(sleep_for);
     }
     stop_linux_session(&shared);
 }

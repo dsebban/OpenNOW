@@ -1,0 +1,10 @@
+captures/
+research/*.json
+__pycache__/
+vendor/
+.toolchain/
+.venv/
+build/
+research/*.txt
+aqtinstall.log
+.runtime/

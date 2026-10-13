@@ -1,6 +1,37 @@
 use super::*;
 use std::net::TcpListener;
 
+#[test]
+fn control_protocol_failure_distinguishes_peer_close_without_logging_peer_text() {
+    use tungstenite::error::ProtocolError;
+
+    for (error, expected) in [
+        (
+            ProtocolError::ResetWithoutClosingHandshake,
+            "peer_closed_without_handshake",
+        ),
+        (
+            ProtocolError::InvalidHeader(Box::new("privacy-protocol-secret".parse().unwrap())),
+            "handshake_violation",
+        ),
+        (ProtocolError::UnknownDataFrameType(255), "invalid_frame"),
+    ] {
+        let failure = ControlFailure::from_error(&tungstenite::Error::Protocol(error));
+        assert_eq!(failure.category, ControlFailureCategory::Protocol);
+        assert_eq!(failure.protocol_kind, Some(expected));
+        let text = ControlExit::ReadFailed(failure).to_string();
+        assert!(text.contains(&format!("protocol_kind={expected}")));
+        assert!(!text.contains("privacy-protocol-secret"));
+    }
+    let failure = ControlFailure::from_error(&tungstenite::Error::Io(std::io::Error::new(
+        ErrorKind::UnexpectedEof,
+        "privacy-protocol-secret",
+    )));
+    assert_eq!(failure.protocol_kind, None);
+    assert_eq!(failure.io_kind, Some(ErrorKind::UnexpectedEof));
+    assert!(!failure.to_string().contains("privacy-protocol-secret"));
+}
+
 fn socket_pair() -> (RtspClient, WebSocket<TcpStream>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

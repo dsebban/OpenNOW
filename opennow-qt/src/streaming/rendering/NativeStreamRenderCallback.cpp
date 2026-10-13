@@ -47,6 +47,8 @@ public:
     explicit NativeStreamRenderCallback(NativeStreamRuntime *runtime)
         : m_runtime(runtime)
     {
+        if (qEnvironmentVariableIsSet("OPENNOW_FEC_DEADLINE_MODE_FILE"))
+            m_swapTimings.enableFreshPresentationHistory();
     }
 
     void initialize(QRhi *rhi, QRhiCommandBuffer *commandBuffer,
@@ -407,6 +409,21 @@ public:
         stats.insert(QStringLiteral("submitOverflowTotal"), qulonglong(snapshot.submitOverflowTotal));
         stats.insert(QStringLiteral("submitMaxMs"), double(snapshot.submitMaxNs) / 1.0e6);
         stats.insert(QStringLiteral("ptsDiscontinuitiesTotal"), qulonglong(snapshot.ptsDiscontinuitiesTotal));
+        if (!snapshot.freshPresentationHistory.empty()) {
+            QVariantList history;
+            history.reserve(snapshot.freshPresentationHistory.size());
+            for (const auto &entry : snapshot.freshPresentationHistory) {
+                history.append(QVariantMap{
+                    {QStringLiteral("ordinal"), QString::number(entry.ordinal)},
+                    {QStringLiteral("ptsNs"), QString::number(entry.mediaPtsNs)},
+                    {QStringLiteral("submitNs"), QString::number(entry.submitNs)},
+                    {QStringLiteral("swapNs"), QString::number(entry.swapNs)},
+                });
+            }
+            stats.insert(QStringLiteral("freshPresentationHistory"), history);
+            stats.insert(QStringLiteral("freshPresentationHistoryOmitted"),
+                         QString::number(snapshot.freshPresentationHistoryOmitted));
+        }
         stats.insert(QStringLiteral("windowSwapsTotal"), qulonglong(snapshot.windowSwapsTotal));
         stats.insert(QStringLiteral("windowSwapsWithoutFreshSourceTotal"), qulonglong(snapshot.windowSwapsWithoutFreshSourceTotal));
         stats.insert(QStringLiteral("windowIntervalSamplesTotal"), qulonglong(snapshot.windowIntervalSamplesTotal));
@@ -444,7 +461,7 @@ public:
         const int kind = m_submittedKind.exchange(0);
         if (kind) {
             ++m_outputCount;
-            m_swapTimings.markSwap(clockNs());
+            if (kind == 1) m_swapTimings.markSwap(clockNs());
         }
         if (kind == 2) m_midpointSwapped.store(true);
         const auto now = clockNs();
@@ -500,7 +517,7 @@ public:
                 || m_presentationGeneration != m_runtime->presentationGeneration()) return;
         const bool drawIssued = m_textures.render(commandBuffer, m_stencil, m_stencilReference);
         m_swapTimings.markRenderCall(drawIssued, m_outputDirty && m_outputKind == 1);
-        if (m_outputDirty) {
+        if (m_outputDirty && drawIssued) {
             m_submittedKind.store(m_outputKind);
             m_outputDirty = false;
             if (m_outputKind == 1) m_swapTimings.markSubmit(clockNs(), m_sourceMediaPtsNs);

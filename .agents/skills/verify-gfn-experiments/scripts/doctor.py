@@ -107,7 +107,7 @@ def capabilities():
         return {'available': False}
 
 
-def observer(client, display_hz=60):
+def observer(client, display_hz=60, video_width=1920, video_height=1080):
     spec = importlib.util.spec_from_file_location('gfn_trial_doctor', ROOT / 'tools/live-trial.py')
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -132,7 +132,7 @@ def observer(client, display_hz=60):
     fresh = [item for item in latest.values() if numeric(item.get('wallTimeMs'))
              and 0 <= now - item['wallTimeMs'] <= 5000
              and client and item['wallTimeMs'] >= client['started_wall_ms']]
-    healthy = [item for item in fresh if module.healthy(item, display_hz) is None]
+    healthy = [item for item in fresh if module.healthy(item, display_hz, video_width, video_height) is None]
     result = {'available': bool(latest), 'fresh_observers': len(fresh),
               'healthy_observers': len(healthy), 'ready': len(healthy) == 1}
     if not fresh:
@@ -148,7 +148,7 @@ def observer(client, display_hz=60):
             if key in chosen:
                 result[key] = chosen[key]
         if not result['ready']:
-            result.setdefault('reason', module.healthy(chosen, display_hz))
+            result.setdefault('reason', module.healthy(chosen, display_hz, video_width, video_height))
     return result
 
 
@@ -156,8 +156,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--require-stream', action='store_true', help='Fail unless current Qt telemetry is healthy')
     parser.add_argument('--capabilities', action='store_true', help='Also query advertised VA-API profiles before scoring')
-    parser.add_argument('--display-hz', type=int, choices=(60, 120), default=60,
+    parser.add_argument('--display-hz', type=int, choices=(60, 100, 120), default=60,
                         help='Expected display refresh; does not change the 60 FPS source profile')
+    parser.add_argument('--video-width', type=int, default=1920,
+                        help='Expected Qt-reported source width')
+    parser.add_argument('--video-height', type=int, default=1080,
+                        help='Expected Qt-reported source height')
     args = parser.parse_args()
     result = {'schema': 1, 'checked_wall_ms': round(time.time() * 1000), 'requested_display_hz': args.display_hz,
               'auth': 'Not probed. Confirm saved-account readiness through the normal GUI.',
@@ -166,7 +170,7 @@ def main():
               'rmem_default': integer_file('/proc/sys/net/core/rmem_default')}
     clients = [item for item in result['processes'] if item['program'] == 'opennow-qt']
     client = clients[0] if len(clients) == 1 and clients[0]['expected_build'] else None
-    result['observer'] = observer(client, args.display_hz)
+    result['observer'] = observer(client, args.display_hz, args.video_width, args.video_height)
     if args.capabilities:
         result['capabilities'] = capabilities()
     issues = []

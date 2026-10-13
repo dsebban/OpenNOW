@@ -1,0 +1,4 @@
+interface:
+  display_name: "Start GFN with HDR"
+  short_description: "Start native OpenNOW with Wayland HDR on the NucBox"
+  default_prompt: "Use $start-gfn-hdr to start the native GeForce NOW client with HDR on this NucBox and check the actual stream color output."

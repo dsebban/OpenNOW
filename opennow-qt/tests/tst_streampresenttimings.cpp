@@ -23,6 +23,39 @@ class StreamPresentTimingsTest : public QObject
 {
     Q_OBJECT
 private slots:
+    void freshPresentationIdentityIsOptionalBoundedAndRejectsRepeatedPts()
+    {
+        StreamPresentTimings timings;
+        timings.markSubmit(1, 100);
+        timings.markSwap(2);
+        QVERIFY(timings.snapshot().freshPresentationHistory.empty());
+        timings.enableFreshPresentationHistory();
+        timings.markSwap(3); // No fresh submission.
+        QVERIFY(timings.snapshot().freshPresentationHistory.empty());
+        timings.markSubmit(4, 100);
+        timings.markSwap(5);
+        timings.markSubmit(6, 100); // The same imported source is not fresh.
+        timings.markSwap(7);
+        QCOMPARE(timings.snapshot().freshPresentationHistory.size(), std::size_t(1));
+        timings.setGated(true);
+        timings.markSubmit(8, 200);
+        timings.markSwap(9);
+        QCOMPARE(timings.snapshot().freshPresentationHistory.size(), std::size_t(1));
+        timings.setGated(false);
+        for (std::uint64_t pts = 101; pts <= 400; ++pts) {
+            timings.markSubmit(pts * 10, pts);
+            timings.markSwap(pts * 10 + 1);
+        }
+        const auto snapshot = timings.snapshot();
+        QCOMPARE(snapshot.freshPresentationHistory.size(), StreamPresentTimings::WindowCapacity);
+        QCOMPARE(snapshot.freshPresentationHistoryOmitted, std::uint64_t(45));
+        QCOMPARE(snapshot.freshPresentationHistory.back().mediaPtsNs, std::uint64_t(400));
+        QCOMPARE(snapshot.freshPresentationHistory.back().submitNs, std::int64_t(4000));
+        QCOMPARE(snapshot.freshPresentationHistory.back().swapNs, std::int64_t(4001));
+        timings.reset();
+        QVERIFY(timings.snapshot().freshPresentationHistory.empty());
+    }
+
     void renderCensusCountsDrawsSeparatelyFromFreshMarkRequests()
     {
         StreamPresentTimings timings;

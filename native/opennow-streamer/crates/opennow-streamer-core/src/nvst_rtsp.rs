@@ -746,6 +746,7 @@ pub struct ActiveNvstRtspSession {
 struct ControlFailure {
     category: ControlFailureCategory,
     io_kind: Option<ErrorKind>,
+    protocol_kind: Option<&'static str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -773,6 +774,7 @@ impl ControlFailure {
                 return Self {
                     category: Category::Io,
                     io_kind: Some(error.kind()),
+                    protocol_kind: None,
                 };
             }
             Error::ConnectionClosed => Category::ConnectionClosed,
@@ -790,6 +792,40 @@ impl ControlFailure {
         Self {
             category,
             io_kind: None,
+            protocol_kind: match error {
+                Error::Protocol(error) => {
+                    use tungstenite::error::ProtocolError as Protocol;
+                    Some(match error {
+                        Protocol::ResetWithoutClosingHandshake => "peer_closed_without_handshake",
+                        Protocol::SendAfterClosing => "send_after_closing",
+                        Protocol::ReceivedAfterClosing => "received_after_closing",
+                        Protocol::InvalidCloseSequence => "invalid_close_sequence",
+                        Protocol::NonZeroReservedBits
+                        | Protocol::UnmaskedFrameFromClient
+                        | Protocol::MaskedFrameFromServer
+                        | Protocol::FragmentedControlFrame
+                        | Protocol::ControlFrameTooBig
+                        | Protocol::UnknownControlFrameType(_)
+                        | Protocol::UnknownDataFrameType(_)
+                        | Protocol::UnexpectedContinueFrame
+                        | Protocol::ExpectedFragment(_)
+                        | Protocol::InvalidOpcode(_) => "invalid_frame",
+                        Protocol::WrongHttpMethod
+                        | Protocol::WrongHttpVersion
+                        | Protocol::MissingConnectionUpgradeHeader
+                        | Protocol::MissingUpgradeWebSocketHeader
+                        | Protocol::MissingSecWebSocketVersionHeader
+                        | Protocol::MissingSecWebSocketKey
+                        | Protocol::SecWebSocketAcceptKeyMismatch
+                        | Protocol::SecWebSocketSubProtocolError(_)
+                        | Protocol::InvalidHeader(_)
+                        | Protocol::HandshakeIncomplete
+                        | Protocol::HttparseError(_) => "handshake_violation",
+                        _ => "other_protocol",
+                    })
+                }
+                _ => None,
+            },
         }
     }
 }
@@ -800,8 +836,10 @@ impl std::fmt::Display for ControlFailure {
         // never for tungstenite::Error or any peer-supplied payload.
         write!(
             f,
-            "error_category={:?} io_kind={:?}",
-            self.category, self.io_kind
+            "error_category={:?} io_kind={:?} protocol_kind={}",
+            self.category,
+            self.io_kind,
+            self.protocol_kind.unwrap_or("none")
         )
     }
 }

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <vector>
 
 class StreamPresentTimings
@@ -13,6 +14,12 @@ public:
     static constexpr std::size_t WindowCapacity = 256;
     static constexpr std::size_t HistogramCapacity = 512;
     using Histogram = std::array<std::uint64_t, HistogramCapacity>;
+    struct FreshPresentation {
+        std::uint64_t ordinal = 0;
+        std::uint64_t mediaPtsNs = 0;
+        std::int64_t submitNs = 0;
+        std::int64_t swapNs = 0;
+    };
 
     struct Stage
     {
@@ -24,6 +31,8 @@ public:
     struct Snapshot
     {
         bool available = false;
+        std::vector<FreshPresentation> freshPresentationHistory;
+        std::uint64_t freshPresentationHistoryOmitted = 0;
         Stage submitToSwap;
         std::size_t windowSamples = 0;
         std::uint64_t swappedFramesTotal = 0;
@@ -59,6 +68,12 @@ public:
         std::uint64_t renderFreshSubmitsTotal = 0;
     };
 
+    void enableFreshPresentationHistory()
+    {
+        const std::lock_guard lock(m_mutex);
+        if (!m_freshHistory) m_freshHistory = std::make_unique<std::array<FreshPresentation, WindowCapacity>>();
+    }
+
     void markSubmit(std::int64_t nowNs, std::uint64_t mediaPtsNs = 0)
     {
         const std::lock_guard lock(m_mutex);
@@ -87,6 +102,13 @@ public:
         m_intervalAnchorNs = nowNs;
         m_hasIntervalAnchor = true;
         ++m_sourceSwapsTotal;
+        if (m_freshHistory && m_pendingMediaPtsNs != 0
+                && (!m_freshHistoryCount || m_pendingMediaPtsNs != m_lastHistoryPtsNs)) {
+            const auto ordinal = ++m_freshHistoryCount;
+            (*m_freshHistory)[(ordinal - 1) % WindowCapacity] =
+                {ordinal, m_pendingMediaPtsNs, m_submitNs, nowNs};
+            m_lastHistoryPtsNs = m_pendingMediaPtsNs;
+        }
         if (m_pendingMediaPtsNs != 0) {
             if (!m_hasMediaAnchor || m_pendingMediaPtsNs <= m_previousMediaPtsNs) {
                 if (m_hasMediaAnchor) ++m_ptsDiscontinuitiesTotal;
@@ -148,6 +170,13 @@ public:
     {
         const std::lock_guard lock(m_mutex);
         Snapshot result;
+        if (m_freshHistory) {
+            const auto count = std::min<std::uint64_t>(m_freshHistoryCount, WindowCapacity);
+            result.freshPresentationHistory.reserve(count);
+            for (auto ordinal = m_freshHistoryCount - count + 1; ordinal <= m_freshHistoryCount; ++ordinal)
+                result.freshPresentationHistory.push_back((*m_freshHistory)[(ordinal - 1) % WindowCapacity]);
+            result.freshPresentationHistoryOmitted = m_freshHistoryCount - count;
+        }
         result.windowSamples = m_windowSamples;
         result.swappedFramesTotal = m_swappedFramesTotal;
         result.hasLastSwap = m_hasLastSwap;
@@ -214,6 +243,8 @@ public:
         const std::lock_guard lock(m_mutex);
         m_hasPendingSubmit = false;
         m_sampleCount = 0;
+        m_freshHistoryCount = 0;
+        m_lastHistoryPtsNs = 0;
         m_windowSamples = 0;
         m_sourceIntervalHistogramMs = {};
         m_submitHistogramMs = {};
@@ -259,6 +290,9 @@ private:
     }
 
     mutable std::mutex m_mutex;
+    std::unique_ptr<std::array<FreshPresentation, WindowCapacity>> m_freshHistory;
+    std::uint64_t m_freshHistoryCount = 0;
+    std::uint64_t m_lastHistoryPtsNs = 0;
     std::vector<std::int64_t> m_samples = std::vector<std::int64_t>(WindowCapacity);
     std::size_t m_sampleCount = 0;
     std::size_t m_windowSamples = 0;

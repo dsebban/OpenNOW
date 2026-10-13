@@ -3,7 +3,7 @@
 //! Phase stamps are wall-only. CPU is sampled at bracketed bin opportunities,
 //! not per packet; it cannot assign CPU/non-CPU time to an individual phase/stall.
 //! Worker-wide wall minus CPU is non-CPU elapsed time, NOT scheduler/runqueue cause.
-//! The 180-s logical cutoff is checked by this owner, not an independent watchdog:
+//! The configured logical cutoff is checked by this owner, not an independent watchdog:
 //! blocked owners can export late or never. Cutoff/partial records are not full coverage.
 // Portable tests share the accumulator, but do not compile Linux export/sampling.
 #![cfg_attr(
@@ -14,9 +14,132 @@ use std::time::Instant;
 
 pub(super) const BIN_NS: u64 = 100_000_000;
 const BIN_COUNT: usize = 1_800;
+const MAX_BIN_COUNT: usize = 18_000;
 const LONG_CAP: usize = 1_024;
 const LONG_NS: u64 = 1_000_000;
 pub(super) const SPLIT_STRIDE: u64 = 16;
+
+/// One-shot arming is checked at most every 100 ms on the receive owner.
+/// A pending arm does not allocate capture bins or start the capture timer.
+#[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
+pub(super) struct CaptureRequest {
+    arm_file: Option<std::path::PathBuf>,
+    next_check: Instant,
+    attempted: bool,
+}
+
+#[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
+impl CaptureRequest {
+    pub(super) fn new() -> Self {
+        let arm_file = std::env::var_os("OPENNOW_NVST_RECEIVE_DIAGNOSTICS_ARM_FILE")
+            .map(std::path::PathBuf::from);
+        let invalid_arm = arm_file.as_ref().is_some_and(|path| !path.is_absolute());
+        if invalid_arm {
+            opennow_streamer_protocol::log::log_async(
+                "WARN",
+                "receive-diag",
+                "status=non-absolute-arm-file",
+            );
+        }
+        Self {
+            arm_file,
+            next_check: Instant::now(),
+            attempted: invalid_arm
+                || std::env::var_os("OPENNOW_NVST_RECEIVE_DIAGNOSTICS_FILE").is_none(),
+        }
+    }
+
+    pub(super) fn take_ready(&mut self, now: Instant) -> bool {
+        if self.attempted {
+            return false;
+        }
+        if let Some(path) = self.arm_file.as_ref() {
+            if now < self.next_check {
+                return false;
+            }
+            self.next_check = now + std::time::Duration::from_millis(100);
+            if !path.is_file() {
+                return false;
+            }
+        }
+        self.attempted = true;
+        true
+    }
+
+    pub(super) fn timer_origin(&self) -> &'static str {
+        if self.arm_file.is_some() {
+            "operator_arm"
+        } else {
+            "worker_setup"
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "receive-diagnostics"))]
+#[test]
+fn pending_capture_arms_once_and_only_at_a_poll_opportunity() {
+    let now = Instant::now();
+    let dir = std::env::temp_dir().join(format!("opennow-arm-test-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("arm");
+    let mut request = CaptureRequest {
+        arm_file: Some(path.clone()),
+        next_check: now,
+        attempted: false,
+    };
+    assert!(!request.take_ready(now));
+    assert!(!request.attempted);
+    std::fs::write(&path, []).unwrap();
+    assert!(!request.take_ready(now + std::time::Duration::from_millis(99)));
+    assert!(request.take_ready(now + std::time::Duration::from_millis(100)));
+    assert_eq!(request.timer_origin(), "operator_arm");
+    assert!(!request.take_ready(now + std::time::Duration::from_secs(1)));
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
+/// Input accepted by the SCTP queue, not proof of delivery to the remote game.
+/// This owner-local diagnostic retains timing only, never input contents.
+#[derive(Default)]
+pub(super) struct InputQueueProgress {
+    total: u64,
+    first_us: u64,
+    last_us: u64,
+    max_gap_us: u64,
+}
+
+impl InputQueueProgress {
+    pub(super) fn record(&mut self, now_us: u64) {
+        if self.total == 0 {
+            self.first_us = now_us;
+        } else {
+            self.max_gap_us = self.max_gap_us.max(now_us.saturating_sub(self.last_us));
+        }
+        self.total = self.total.saturating_add(1);
+        self.last_us = now_us;
+    }
+
+    pub(super) fn log_line(&self) -> String {
+        format!(
+            "input_queued_total={} input_first_us={} input_last_us={} input_max_gap_us={}",
+            self.total, self.first_us, self.last_us, self.max_gap_us
+        )
+    }
+}
+
+#[test]
+fn input_progress_retains_long_idle_gap_despite_a_later_input_burst() {
+    let mut progress = InputQueueProgress::default();
+    progress.record(1_000);
+    progress.record(1_010);
+    progress.record(30_001_010);
+    progress.record(30_001_020);
+    assert_eq!(progress.total, 4);
+    assert_eq!(progress.first_us, 1_000);
+    assert_eq!(progress.last_us, 30_001_020);
+    assert_eq!(progress.max_gap_us, 30_000_000);
+}
+
 const PHASE_BOUNDARIES: &str = "Receive starts at the existing worker loop-top instant, except ping iterations use a fresh post-ping stamp and sample iterations use the socket-query end. Receive ends immediately after recv_from; Preprocess ends at the original process-call timestamp; Process ends at a fresh post-call stamp. Forward and Service end at the existing post-match instant; Between runs from that completion to the next receive start. Completion excludes diagnostic final bookkeeping; Between includes it. Inner phases are fixed-stride successful-receive samples; Receive/Between/Service remain exhaustive.";
 
 #[derive(Clone, Copy)]
@@ -113,6 +236,7 @@ struct LongSpan {
 
 pub(super) struct Capture {
     origin: Instant,
+    timer_origin: &'static str,
     bins: Vec<Bin>,
     longs: Vec<LongSpan>,
     omitted: u64,
@@ -147,9 +271,15 @@ pub(super) struct Capture {
 }
 impl Capture {
     pub(super) fn new() -> Self {
+        Self::with_bin_count(BIN_COUNT)
+    }
+
+    fn with_bin_count(bin_count: usize) -> Self {
+        debug_assert!((BIN_COUNT..=MAX_BIN_COUNT).contains(&bin_count));
         Self {
             origin: Instant::now(),
-            bins: vec![Bin::default(); BIN_COUNT],
+            timer_origin: "worker_setup",
+            bins: vec![Bin::default(); bin_count],
             longs: Vec::with_capacity(LONG_CAP),
             omitted: 0,
             receive_long_excluded: 0,
@@ -287,7 +417,7 @@ impl Capture {
     #[inline]
     fn bin(&mut self, end: Stamp) -> Option<&mut Bin> {
         let index = (end.wall / BIN_NS) as usize;
-        if index >= BIN_COUNT {
+        if index >= self.bins.len() {
             self.cutoff_spans += 1;
             return None;
         }
@@ -434,15 +564,19 @@ impl Capture {
     pub(super) fn service_end(&mut self, end: Stamp) {
         self.last_service = Some(end);
     }
+    /// Seed only before the first observed service when arming a running receiver.
+    pub(super) fn seed_counts(&mut self, counts: [u64; 6]) {
+        self.previous_counts = counts;
+    }
+
     // Cumulative receiver counters remain separate from socket successes.
     #[inline]
     pub(super) fn counters(&mut self, end: Stamp, counts: [u64; 6]) {
         let previous = self.previous_counts;
         self.previous_counts = counts;
-        // The timer starts with the worker, not with a verified scene. These
-        // processing-completion endpoints bound authentication/assembly evidence,
+        // These processing-completion endpoints bound authentication/assembly evidence,
         // not continuous decode/presentation or scene-valid coverage.
-        if end.wall < BIN_NS * BIN_COUNT as u64 {
+        if end.wall < BIN_NS * self.bins.len() as u64 {
             if counts[0] > previous[0] {
                 self.first_authenticated_ns.get_or_insert(end.wall);
                 self.last_authenticated_ns = Some(end.wall);
@@ -470,7 +604,7 @@ impl Capture {
         }
     }
     #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
-    pub(super) fn start() -> Option<Self> {
+    pub(super) fn start_with_origin(timer_origin: &'static str) -> Option<Self> {
         use std::os::unix::fs::OpenOptionsExt;
         use std::sync::atomic::{AtomicBool, Ordering};
         static CLAIMED: AtomicBool = AtomicBool::new(false);
@@ -484,6 +618,27 @@ impl Capture {
             );
             return None;
         }
+        let bin_count = match std::env::var_os("OPENNOW_NVST_RECEIVE_DIAGNOSTICS_DURATION_SECONDS") {
+            None => BIN_COUNT,
+            Some(value) => {
+                let seconds = value
+                    .to_str()
+                    .filter(|value| {
+                        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|seconds| (180..=1800).contains(seconds));
+                let Some(seconds) = seconds else {
+                    opennow_streamer_protocol::log::log_async(
+                        "WARN",
+                        "receive-diag",
+                        "status=invalid-duration-seconds",
+                    );
+                    return None;
+                };
+                seconds * 10
+            }
+        };
         if CLAIMED.swap(true, Ordering::Relaxed) {
             opennow_streamer_protocol::log::log_async(
                 "INFO",
@@ -509,7 +664,8 @@ impl Capture {
                 return None;
             }
         };
-        let mut capture = Self::new();
+        let mut capture = Self::with_bin_count(bin_count);
+        capture.timer_origin = timer_origin;
         capture.output = Some(output);
         let before = capture.stamp().wall;
         let mut ts = libc::timespec {
@@ -527,8 +683,9 @@ impl Capture {
             "INFO",
             "receive-diag",
             &format!(
-                "schema=3 status=started pid={} tid={} role={} duration_ms=180000 bin_ms=100 timer_origin=worker_setup media_coverage=unverified span_cpu=unsampled",
-                capture.pid, capture.tid, capture.role
+                "schema=3 status=started pid={} tid={} role={} duration_ms={} bin_ms=100 timer_origin={} media_coverage=unverified span_cpu=unsampled",
+                capture.pid, capture.tid, capture.role,
+                BIN_NS * capture.bins.len() as u64 / 1_000_000, capture.timer_origin
             ),
         );
         Some(capture)
@@ -555,8 +712,8 @@ impl Capture {
         };
         // Fast path reuses the ordinary loop clock; no new clock read or syscall.
         let before = capture.stamp_at(loop_now).wall;
-        let complete = before >= BIN_NS * BIN_COUNT as u64;
-        let index = (before / BIN_NS).min(BIN_COUNT as u64 - 1) as usize;
+        let complete = before >= BIN_NS * capture.bins.len() as u64;
+        let index = (before / BIN_NS).min(capture.bins.len() as u64 - 1) as usize;
         if !complete && capture.bins[index].socket.is_some() {
             return None;
         }
@@ -572,8 +729,8 @@ impl Capture {
     ) -> Option<Stamp> {
         use std::os::fd::AsRawFd;
         let capture = owner.as_mut()?;
-        let complete = before >= BIN_NS * BIN_COUNT as u64;
-        let index = (before / BIN_NS).min(BIN_COUNT as u64 - 1) as usize;
+        let complete = before >= BIN_NS * capture.bins.len() as u64;
+        let index = (before / BIN_NS).min(capture.bins.len() as u64 - 1) as usize;
         let cpu_sample = capture.sample_cpu();
         let socket_before = capture.stamp().wall;
         let mut memory = [0u32; 9];
@@ -622,6 +779,7 @@ impl Capture {
             self.final_cpu_sample = Some(self.sample_cpu());
         }
         let elapsed = self.stamp().wall;
+        let bin_count = self.bins.len();
         let preallocated_bytes = std::mem::size_of::<Self>()
             + self.bins.capacity() * std::mem::size_of::<Bin>()
             + self.longs.capacity() * std::mem::size_of::<LongSpan>();
@@ -637,6 +795,8 @@ impl Capture {
             }).collect();
             let longs: Vec<_> = self.longs.iter().map(|s| serde_json::json!([s.phase,s.start.wall,s.end.wall,null,null,s.inner_split_selected])).collect();
             let mut value = serde_json::json!({"schema":3,"phase_boundaries":PHASE_BOUNDARIES,"complete":complete,"preallocated_bytes":preallocated_bytes,"elapsed_ns":elapsed,"pid":self.pid,"tid":self.tid,"role":self.role,"realtime_origin_ns":self.realtime_ns,"clock":"Instant-relative-monotonic; realtime anchor approximate only","span_cpu":"unsampled; phase cpu_missing counts intentional absence of per-span CPU coverage","bin_ns":BIN_NS,"phase_names":PHASES,"phase_fields":["count","wall_ns","thread_cpu_ns","cpu_covered_wall_ns","cpu_missing","cpu_invalid","max_wall_ns"],"socket_fields":["before_ns","after_ns","SO_MEMINFO_u32"],"socket_memory_fields":["rmem_alloc","rcvbuf","wmem_alloc","sndbuf","fwd_alloc","wmem_queued","optmem","backlog","drops"],"long_fields":["phase","start_ns","end_ns","start_cpu_ns","end_cpu_ns","inner_split_selected"],"long_omitted":self.omitted,"cutoff_spans":self.cutoff_spans,"monotonic_anchor":self.monotonic_anchor,"final_socket":self.final_socket.map(|s|serde_json::json!([s.before,s.after,s.memory])),"socket_errors":self.socket_errors,"bins":bins,"long_spans":longs,"limits":"complete means timer reached, not full coverage. Partial exit can omit terminal in-flight phase/counters. Completion bins are not utilization bins. Delivered receive timing only; no kernel arrivals or scheduler trace. Socket drops are interval brackets; memory is not payload bytes. Non-CPU elapsed is not runqueue or blocking attribution."});
+            value["duration_ms"] = serde_json::json!(BIN_NS * bin_count as u64 / 1_000_000);
+            value["bin_count"] = serde_json::json!(bin_count);
             value["phase_sampling"] = serde_json::json!({
                 "stride":SPLIT_STRIDE,"policy":"successful receive ordinals 1,17,33,... including startup/warmup",
                 "sampled_phases":["preprocess","process","forward"],
@@ -647,7 +807,7 @@ impl Capture {
                 "limits":"Completion-bin denominators, not raw receipts. Unsampled Service tails retain full endpoints but no inner localization. Selected phases describe their cohort only: never extrapolate totals/maxima/percentiles. Deterministic stride may align with frame structure, not unbiased sampling. Tail selection=true does not override partial/cutoff/omission limits; per-span CPU remains unsampled."
             });
             value["cpu_sampling"] = serde_json::json!({"policy":"one bracketed thread-CPU snapshot at the first worker opportunity per 100-ms bin, plus final snapshot","fields":["before_ns","thread_cpu_ns","after_ns"],"errors":self.cpu_sample_errors,"final":self.final_cpu_sample.map(|s|serde_json::json!([s.before,s.cpu,s.after])),"limits":"Worker-wide snapshot differences include receive, inline work, housekeeping and diagnostics. No per-span CPU or blocking/preemption/runqueue attribution; delayed worker means delayed snapshots."});
-            value["media_coverage"] = serde_json::json!({"timer_origin":"worker_setup","first_authenticated_ns":self.first_authenticated_ns,"last_authenticated_ns":self.last_authenticated_ns,"first_assembled_ns":self.first_assembled_ns,"last_assembled_ns":self.last_assembled_ns,"limits":"Processing-completion endpoints only, not continuous media/decode/presentation or verified scene coverage. Startup is included; scene validation after timer start does not earn 180 seconds of valid scene."});
+            value["media_coverage"] = serde_json::json!({"timer_origin":self.timer_origin,"first_authenticated_ns":self.first_authenticated_ns,"last_authenticated_ns":self.last_authenticated_ns,"first_assembled_ns":self.first_assembled_ns,"last_assembled_ns":self.last_assembled_ns,"limits":"Processing-completion endpoints only, not continuous media/decode/presentation or verified scene coverage. Operator must verify arming and scene coverage; timer completion alone does not establish 180 seconds of valid scene."});
             value["long_policy"] = serde_json::json!({"threshold_ns":LONG_NS,"capacity":LONG_CAP,"receive_long_excluded":self.receive_long_excluded,"limits":"Receive has aggregate accounting only, never interval-tail records. Other phases share the capped tail pool; no full receive interval trace."});
             let ok = serde_json::to_writer(&mut output, &value).is_ok() && output.flush().is_ok();
             opennow_streamer_protocol::log::log_async(if ok { "INFO" } else { "WARN" }, "receive-diag", if ok { "status=exported" } else { "status=export-failed" });
@@ -693,6 +853,18 @@ mod tests {
     use super::*;
     fn stamp(wall: u64) -> Stamp {
         Stamp { wall }
+    }
+
+    #[test]
+    fn armed_capture_excludes_receiver_history_from_interval_counts() {
+        let mut capture = Capture::new();
+        capture.seed_counts([100_000, 10_000, 50, 7, 2, 3]);
+        capture.counters(stamp(1_000), [100_001, 10_001, 51, 7, 2, 3]);
+        assert_eq!(capture.bins[0].accepted, 1);
+        assert_eq!(capture.bins[0].assembled, 1);
+        assert_eq!(capture.bins[0].repaired, 1);
+        assert_eq!(capture.first_authenticated_ns, Some(1_000));
+        assert_eq!(capture.first_assembled_ns, Some(1_000));
     }
     #[cfg(all(target_os = "linux", feature = "receive-diagnostics"))]
     #[test]

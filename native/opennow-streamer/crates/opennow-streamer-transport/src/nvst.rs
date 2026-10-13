@@ -604,6 +604,8 @@ impl RecentNetworkMetrics {
 
 #[derive(Debug)]
 pub struct NvstFeedbackState {
+    #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+    fec_deadline_experiment: Option<Arc<fec_deadline_experiment::Experiment>>,
     pub haptics: crate::NvstHaptics,
     /// Bound video stream SSRC (0 until the first packet is authenticated).
     video_ssrc: AtomicU32,
@@ -633,6 +635,8 @@ impl Default for NvstFeedbackState {
     fn default() -> Self {
         Self {
             haptics: crate::NvstHaptics::default(),
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            fec_deadline_experiment: fec_deadline_experiment::Experiment::from_env(),
             video_ssrc: AtomicU32::new(0),
             highest_sequence: AtomicU32::new(0),
             base_sequence: AtomicU32::new(u32::MAX),
@@ -856,6 +860,10 @@ impl NvstFeedbackState {
                 queued.requested_at = now;
                 queued.last_sent_at = None;
                 queued.attempts = 0;
+                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                if let Some(experiment) = self.fec_deadline_experiment.as_ref() {
+                    experiment.enqueued(first, last, now);
+                }
             }
             return;
         }
@@ -869,6 +877,10 @@ impl NvstFeedbackState {
             last_sent_at: None,
             attempts: 0,
         });
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if let Some(experiment) = self.fec_deadline_experiment.as_ref() {
+            experiment.enqueued(first_missing_index, last_missing_index, now);
+        }
     }
 
     fn resolve_nack(&self, received_index: u64) -> bool {
@@ -905,6 +917,12 @@ impl NvstFeedbackState {
     }
 
     fn publish_completed_frame(&self, frame: &EncodedVideoAccessUnit) {
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if frame.keyframe
+            && let Some(experiment) = self.fec_deadline_experiment.as_ref()
+        {
+            experiment.assembled_keyframe(frame.frame_index, frame.timestamp, frame.contiguous);
+        }
         self.last_sender_frame
             .store(frame.frame_index, Ordering::Release);
         self.completed_frame_bytes.fetch_add(
@@ -1250,6 +1268,10 @@ impl NvstFeedbackState {
         range.last_sent_at = Some(now);
         range.attempts = range.attempts.saturating_add(1);
         let result = (range.first, range.last);
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if let Some(experiment) = self.fec_deadline_experiment.as_ref() {
+            experiment.taken(range.first, range.last, range.attempts, retry_rtt, now);
+        }
         pending.insert(index, range);
         Some(result)
     }
@@ -2855,7 +2877,8 @@ fn send_pending_nack(
     if rtc.channel(channel).is_none() {
         return;
     }
-    let retry_rtt = mjolnir.then(|| feedback.ping(now).unwrap_or(DEFAULT_NACK_RTT));
+    let measured_rtt = mjolnir.then(|| feedback.ping(now)).flatten();
+    let retry_rtt = mjolnir.then(|| measured_rtt.unwrap_or(DEFAULT_NACK_RTT));
     let Some((first, last)) = feedback.take_nack(now, retry_rtt) else {
         return;
     };
@@ -2866,6 +2889,10 @@ fn send_pending_nack(
     } else {
         channels.send_rtcp(rtc, &build_rtcp_nack(sender_ssrc, media_ssrc, first, last))
     };
+    #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+    if let Some(experiment) = feedback.fec_deadline_experiment.as_ref() {
+        experiment.admitted(first, last, admitted, measured_rtt, Instant::now());
+    }
     if admitted {
         let format = if mjolnir {
             "private-v2"
@@ -3858,6 +3885,12 @@ struct FecReorderBuffer {
     completed_through: Option<u64>,
     gap_wait: Option<(u64, Instant)>,
     shard_len: usize,
+    #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+    head_probe: Option<fec_reorder_diagnostics::Probe>,
+    #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+    deadline_experiment: Option<Arc<fec_deadline_experiment::Experiment>>,
+    #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+    experiment_feedback: Option<SharedNvstFeedback>,
 }
 
 impl FecReorderBuffer {
@@ -3867,16 +3900,54 @@ impl FecReorderBuffer {
             completed_through: None,
             gap_wait: None,
             shard_len: video_packet_size + NVST_FEC_RTP_HEADER_ALLOWANCE,
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            head_probe: None,
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            deadline_experiment: None,
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            experiment_feedback: None,
         }
     }
 
     fn reset(&mut self) {
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if let Some(experiment) = self.deadline_experiment.as_ref() {
+            experiment.reset(Instant::now());
+        }
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if let Some(probe) = self.head_probe.as_mut()
+            && let Some(base) = probe.current_base()
+        {
+            probe.finish_head(
+                base,
+                Instant::now(),
+                fec_reorder_diagnostics::Outcome::Reset,
+                0,
+                0,
+            );
+        }
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if let Some(probe) = self.head_probe.as_mut() {
+            probe.finish_rtp_gap(Instant::now(), fec_reorder_diagnostics::Outcome::Reset);
+        }
         self.blocks.clear();
         self.completed_through = None;
         self.gap_wait = None;
     }
 
     fn push(&mut self, packet: RtpPacket, layout: FecPacketLayout, now: Instant) -> ReorderResult {
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if let Some(probe) = self.head_probe.as_mut()
+            && let Some(extension) = packet.header.gs_video_header
+        {
+            let fec_word =
+                u32::from_le_bytes(extension[12..16].try_into().expect("fixed FEC header"));
+            probe.record_fec_tuple(
+                ((fec_word >> 4) & 0xff) as u8,
+                layout.data_shards,
+                layout.parity_shards,
+            );
+        }
         let packet_base = packet.index.saturating_sub(layout.shard_index as u64);
         if self
             .completed_through
@@ -3940,6 +4011,32 @@ impl FecReorderBuffer {
                         now
                     }
                 };
+                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                if let Some(probe) = self.head_probe.as_mut() {
+                    let ready_successors = probe
+                        .needs_successor_sample(expected, expected, started, now)
+                        .then(|| {
+                            self.blocks
+                                .values()
+                                .filter(|block| block.has_enough_shards() && !block.repair_failed)
+                                .count()
+                        });
+                    probe.observe_wait(
+                        fec_reorder_diagnostics::WaitSnapshot {
+                            gap_origin: fec_reorder_diagnostics::GapOrigin::WholeMissingBlock,
+                            base: expected,
+                            frame_index: head.layout.frame_index,
+                            block_index: head.layout.block_index,
+                            last_block_index: head.layout.last_block_index,
+                            first_missing: expected,
+                            last_missing: base - 1,
+                            gap_started: started,
+                            buffered_blocks: self.blocks.len(),
+                            ready_successors,
+                        },
+                        now,
+                    );
+                }
                 if now.saturating_duration_since(started) < MJOLNIR_REORDER_DEQUEUE_TIMEOUT
                     && base.saturating_sub(expected) < MAX_REORDER_WINDOW as u64
                     && self.blocks.len() < MAX_PENDING_FEC_BLOCKS
@@ -3950,11 +4047,26 @@ impl FecReorderBuffer {
                     first_missing_index: expected,
                     last_missing_index: base - 1,
                 });
+                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                if let Some(probe) = self.head_probe.as_mut() {
+                    probe.finish_head(
+                        expected,
+                        now,
+                        fec_reorder_diagnostics::Outcome::Expired,
+                        0,
+                        0,
+                    );
+                }
                 result.ready.clear();
                 result.nack = None;
                 self.completed_through = Some(base);
                 self.gap_wait = None;
                 continue;
+            }
+
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            if let Some(probe) = self.head_probe.as_mut() {
+                probe.finish_whole_gap_before(base, now);
             }
 
             if head.has_enough_shards() && !head.repair_failed {
@@ -3969,6 +4081,33 @@ impl FecReorderBuffer {
                 let repair_backup = completed.missing_data_range().map(|_| completed.clone());
                 match completed.finish(self.shard_len) {
                     Ok((mut ready, repaired)) => {
+                        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                        if let Some(experiment) = self.deadline_experiment.as_ref()
+                            && experiment.has_active_head()
+                        {
+                            let ready_successors = self
+                                .blocks
+                                .values()
+                                .filter(|block| block.has_enough_shards() && !block.repair_failed)
+                                .count();
+                            experiment.finish_head_with_context(
+                                base,
+                                now,
+                                "completed",
+                                self.blocks.len(),
+                                ready_successors,
+                            );
+                        }
+                        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                        if let Some(probe) = self.head_probe.as_mut() {
+                            probe.finish_head(
+                                base,
+                                now,
+                                fec_reorder_diagnostics::Outcome::Completed,
+                                ready.len(),
+                                repaired,
+                            );
+                        }
                         result.ready.append(&mut ready);
                         result.fec_repaired += repaired;
                         self.completed_through = Some(completed_through);
@@ -3991,9 +4130,43 @@ impl FecReorderBuffer {
                             first_missing,
                             last_missing,
                         );
+                        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                        let pending_layout = pending.layout;
                         self.blocks.insert(base, pending);
                         result.nack = Some((first_missing, last_missing));
                         self.gap_wait = Some((first_missing, now));
+                        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                        if let Some(experiment) = self.deadline_experiment.as_ref() {
+                            experiment.deadline(base, first_missing, last_missing, now, now);
+                        }
+                        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                        if let Some(probe) = self.head_probe.as_mut() {
+                            let ready_successors = self
+                                .blocks
+                                .range((
+                                    std::ops::Bound::Excluded(base),
+                                    std::ops::Bound::Unbounded,
+                                ))
+                                .filter(|(_, block)| {
+                                    block.has_enough_shards() && !block.repair_failed
+                                })
+                                .count();
+                            probe.observe_wait(
+                                fec_reorder_diagnostics::WaitSnapshot {
+                                    gap_origin: fec_reorder_diagnostics::GapOrigin::IncompleteHead,
+                                    base,
+                                    frame_index: pending_layout.frame_index,
+                                    block_index: pending_layout.block_index,
+                                    last_block_index: pending_layout.last_block_index,
+                                    first_missing,
+                                    last_missing,
+                                    gap_started: now,
+                                    buffered_blocks: self.blocks.len(),
+                                    ready_successors: Some(ready_successors),
+                                },
+                                now,
+                            );
+                        }
                         break;
                     }
                 }
@@ -4020,10 +4193,75 @@ impl FecReorderBuffer {
                 .blocks
                 .last_key_value()
                 .map_or(0, |(&last_base, _)| last_base.saturating_sub(base));
-            if now.saturating_duration_since(started) < MJOLNIR_REORDER_DEQUEUE_TIMEOUT
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            if let Some(probe) = self.head_probe.as_mut() {
+                let ready_successors = probe
+                    .needs_successor_sample(base, first_missing, started, now)
+                    .then(|| {
+                        self.blocks
+                            .range((std::ops::Bound::Excluded(base), std::ops::Bound::Unbounded))
+                            .filter(|(_, block)| block.has_enough_shards() && !block.repair_failed)
+                            .count()
+                    });
+                probe.observe_wait(
+                    fec_reorder_diagnostics::WaitSnapshot {
+                        gap_origin: fec_reorder_diagnostics::GapOrigin::IncompleteHead,
+                        base,
+                        frame_index: head.layout.frame_index,
+                        block_index: head.layout.block_index,
+                        last_block_index: head.layout.last_block_index,
+                        first_missing,
+                        last_missing,
+                        gap_started: started,
+                        buffered_blocks: self.blocks.len(),
+                        ready_successors,
+                    },
+                    now,
+                );
+            }
+            let deadline = started + MJOLNIR_REORDER_DEQUEUE_TIMEOUT;
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            let deadline = self
+                .deadline_experiment
+                .as_ref()
+                .map_or(deadline, |experiment| {
+                    experiment.deadline(base, first_missing, last_missing, started, now)
+                });
+            if now < deadline
                 && block_span < MAX_REORDER_WINDOW as u64
                 && self.blocks.len() < MAX_PENDING_FEC_BLOCKS
             {
+                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                if let Some(experiment) = self.deadline_experiment.as_ref() {
+                    experiment.wait_extended(base, now, self.blocks.len(), block_span);
+                    if experiment.needs_preemptive_observation(base) {
+                        let ready_later = self
+                            .blocks
+                            .range((std::ops::Bound::Excluded(base), std::ops::Bound::Unbounded))
+                            .filter(|(_, block)| block.has_enough_shards() && !block.repair_failed)
+                            .count();
+                        let missing_data = head.shards[..head.layout.data_shards]
+                            .iter()
+                            .filter(|shard| shard.is_none())
+                            .count();
+                        experiment.observe_preemptive(
+                            fec_deadline_experiment::PreemptiveObservation {
+                                base,
+                                frame_index: head.layout.frame_index,
+                                block_index: head.layout.block_index,
+                                last_block_index: head.layout.last_block_index,
+                                gap_started: started,
+                                missing_data,
+                                parity: head.layout.parity_shards,
+                                ready_later,
+                            },
+                            Instant::now(),
+                            self.experiment_feedback
+                                .as_ref()
+                                .is_some_and(|feedback| feedback.keyframe_request_pending()),
+                        );
+                    }
+                }
                 break;
             }
 
@@ -4038,6 +4276,27 @@ impl FecReorderBuffer {
                 first_missing_index,
                 last_missing_index,
             });
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            if let Some(experiment) = self.deadline_experiment.as_ref()
+                && experiment.has_active_head()
+            {
+                let ready_successors = self
+                    .blocks
+                    .values()
+                    .filter(|block| block.has_enough_shards() && !block.repair_failed)
+                    .count();
+                experiment.finish_head_with_context(
+                    base,
+                    now,
+                    "expired",
+                    self.blocks.len(),
+                    ready_successors,
+                );
+            }
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            if let Some(probe) = self.head_probe.as_mut() {
+                probe.finish_head(base, now, fec_reorder_diagnostics::Outcome::Expired, 0, 0);
+            }
             result.ready.clear();
             result.nack = None;
             self.completed_through =
@@ -4046,6 +4305,15 @@ impl FecReorderBuffer {
             // Emit any complete successors after the assembler has been marked discontinuous.
         }
         result
+    }
+}
+
+#[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+impl Drop for FecReorderBuffer {
+    fn drop(&mut self) {
+        if let Some(probe) = self.head_probe.take() {
+            probe.finish(Instant::now(), false);
+        }
     }
 }
 
@@ -4177,6 +4445,16 @@ impl NvstVideoReceiver {
             .flatten();
         let reorder = RtpReorderBuffer::new(config.reorder_window_packets);
         let fec_reorder = FecReorderBuffer::new(config.video_packet_size);
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        let mut fec_reorder = fec_reorder;
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        {
+            fec_reorder.deadline_experiment = config.feedback.fec_deadline_experiment.clone();
+            fec_reorder.experiment_feedback = fec_reorder
+                .deadline_experiment
+                .as_ref()
+                .map(|_| Arc::clone(&config.feedback));
+        }
         let assembler = VideoAccessUnitAssembler::new(config.codec, config.max_access_unit_bytes);
         Self {
             config,
@@ -4401,6 +4679,10 @@ impl NvstVideoReceiver {
         self.initial_timeout_pending = false;
         self.frame_progress.authenticated(now);
         self.authenticated_packets += 1;
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if let Some(experiment) = self.config.feedback.fec_deadline_experiment.as_ref() {
+            experiment.arrival(packet.index, now);
+        }
         let sequence = u32::try_from(packet.index & 0xffff_ffff).unwrap_or(u32::MAX);
         let reordered =
             self.authenticated_packets > 1 && sequence <= self.highest_sequence_received;
@@ -4443,7 +4725,40 @@ impl NvstVideoReceiver {
             }
             result
         } else {
-            self.reorder.push(packet, now)
+            let result = self.reorder.push(packet, now);
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            if let Some(probe) = self.fec_reorder.head_probe.as_mut() {
+                if let Some(NvstRecovery::PacketGap {
+                    first_missing_index,
+                    last_missing_index,
+                }) = result.recovery.as_ref()
+                {
+                    if self.reorder.gap_wait.is_none() {
+                        probe.observe_rtp_gap(
+                            *first_missing_index,
+                            *last_missing_index,
+                            now,
+                            self.reorder.packets.len(),
+                            now,
+                        );
+                    }
+                    probe.finish_rtp_gap(now, fec_reorder_diagnostics::Outcome::Expired);
+                }
+                if let Some((first, started)) = self.reorder.gap_wait
+                    && let Some((&available, _)) = self.reorder.packets.first_key_value()
+                {
+                    probe.observe_rtp_gap(
+                        first,
+                        available - 1,
+                        started,
+                        self.reorder.packets.len(),
+                        now,
+                    );
+                } else {
+                    probe.finish_rtp_gap(now, fec_reorder_diagnostics::Outcome::GapFilled);
+                }
+            }
+            result
         };
         self.fec_repaired_packets += result.fec_repaired as u64;
         let mut events = Vec::new();
@@ -6418,6 +6733,10 @@ fn run_nvst_webrtc_bundle(
     let mut input_state = NvstInputChannelState::default();
     let mut input_codec = NvstInputCodec::default();
     let mut last_input_types = Vec::new();
+    #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+    let mut input_queue_progress = std::env::var_os("OPENNOW_NVST_RECEIVE_DIAGNOSTICS_FILE")
+        .filter(|path| std::path::Path::new(path).is_absolute())
+        .map(|_| receive_diagnostics::InputQueueProgress::default());
     let mut mouse_motion_packets = 0_u64;
     let mut cursor_capture = NvstCursorCapture::default();
     let mut control_keepalive_at = next_control_keepalive(Instant::now());
@@ -6555,7 +6874,18 @@ fn run_nvst_webrtc_bundle(
                                         diagnostic_hex(&message.bytes, 128),
                                     );
                                 }
-                                channels.send_encoded(&mut rtc, message)
+                                let queued = channels.send_encoded(&mut rtc, message);
+                                #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+                                if queued && let Some(progress) = input_queue_progress.as_mut() {
+                                    progress.record(
+                                        transport_origin
+                                            .elapsed()
+                                            .as_micros()
+                                            .try_into()
+                                            .unwrap_or(u64::MAX),
+                                    );
+                                }
+                                queued
                             },
                         ) {
                             rtc.disconnect();
@@ -6780,6 +7110,18 @@ fn run_nvst_webrtc_bundle(
         }
 
         if now.duration_since(last_control_stats_log) >= Duration::from_secs(10) {
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            if let Some(progress) = input_queue_progress.as_ref() {
+                opennow_streamer_protocol::log::log_async(
+                    "INFO",
+                    "input-proof",
+                    &format!(
+                        "elapsed_us={} {}",
+                        transport_origin.elapsed().as_micros(),
+                        progress.log_line(),
+                    ),
+                );
+            }
             opennow_streamer_protocol::log::log_async(
                 "INFO",
                 "nvst-bundle",
@@ -6866,6 +7208,21 @@ fn run_nvst_webrtc_bundle(
         // Do not gate control IDR on stream_snapshot(): it is needed most when
         // the server has not sent any video yet. Bound failed sends as well as
         // successful ones, and leave the request armed until a keyframe arrives.
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if let Some(experiment) = feedback.fec_deadline_experiment.as_ref() {
+            experiment.control_poll(
+                upstream_allowed,
+                input_state.control_is_open(),
+                input_channels.is_some(),
+                &mut last_keyframe_attempt,
+                || feedback.keyframe_request_pending(),
+                || {
+                    input_channels.is_some_and(|channels| {
+                        channels.send_control(&mut rtc, &idr_request().encoded())
+                    })
+                },
+            );
+        }
         let (try_pli, try_idr) = feedback.keyframe_request_routes(
             now,
             last_keyframe_attempt,
@@ -6883,6 +7240,12 @@ fn run_nvst_webrtc_bundle(
                 && input_channels.is_some_and(|channels| {
                     channels.send_control(&mut rtc, &idr_request().encoded())
                 });
+            #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+            if try_idr
+                && let Some(experiment) = feedback.fec_deadline_experiment.as_ref()
+            {
+                experiment.ordinary_control_admission(idr_queued, Instant::now());
+            }
             last_keyframe_attempt = now;
             keyframe_attempts = keyframe_attempts.saturating_add(1);
             if last_keyframe_attempt_log
@@ -7367,6 +7730,14 @@ fn run_nvst_webrtc_bundle(
 #[path = "nvst/receive_diagnostics.rs"]
 mod receive_diagnostics;
 
+#[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+#[path = "nvst/fec_reorder_diagnostics.rs"]
+mod fec_reorder_diagnostics;
+
+#[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+#[path = "nvst/fec_deadline_experiment.rs"]
+mod fec_deadline_experiment;
+
 fn run_nvst_udp_receiver(
     socket: UdpSocket,
     config: NvstVideoConfig,
@@ -7411,7 +7782,9 @@ fn run_nvst_udp_receiver(
     let mut last_stats_log = Instant::now();
     let mut reported_port_unreachable = false;
     #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
-    let mut diagnostic = receive_diagnostics::Capture::start();
+    let mut diagnostic_request = receive_diagnostics::CaptureRequest::new();
+    #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+    let mut diagnostic = None;
     loop {
         loop {
             match commands.try_recv() {
@@ -7442,6 +7815,13 @@ fn run_nvst_udp_receiver(
         } else {
             PING_INTERVAL_BEFORE_CONNECTION
         };
+        #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+        if let Some(experiment) = receiver.config.feedback.fec_deadline_experiment.as_ref() {
+            experiment.poll_mode(
+                now,
+                receiver.reorder.gap_wait.is_none() && receiver.fec_reorder.gap_wait.is_none(),
+            );
+        }
         if now.duration_since(last_ping) >= ping_interval {
             if let Some(credentials) = stun_credentials.as_ref() {
                 // Ping version 6 is an authenticated STUN Binding request. The official
@@ -7490,7 +7870,43 @@ fn run_nvst_udp_receiver(
 
         #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
         let receive_start = {
+            if diagnostic_request.take_ready(now) {
+                diagnostic = receive_diagnostics::Capture::start_with_origin(
+                    diagnostic_request.timer_origin(),
+                );
+                if let Some(capture) = diagnostic.as_mut() {
+                    capture.seed_counts([
+                        receiver.authenticated_packets,
+                        receiver.frames_emitted,
+                        receiver.fec_repaired_packets,
+                        handled_stun,
+                        invalid_stun,
+                        wrong_source,
+                    ]);
+                    if let Some(path) = std::env::var_os("OPENNOW_NVST_RECEIVE_DIAGNOSTICS_FILE") {
+                        let path = std::path::PathBuf::from(path).with_extension("fec-head.json");
+                        let preexisting_base = receiver.fec_reorder.gap_wait.and_then(|_| {
+                            receiver
+                                .fec_reorder
+                                .blocks
+                                .first_key_value()
+                                .map(|(&base, _)| {
+                                    receiver.fec_reorder.completed_through
+                                        .map_or(base, |expected| expected.min(base))
+                                })
+                        });
+                        receiver.fec_reorder.head_probe = Some(
+                            fec_reorder_diagnostics::Probe::new(now, path, preexisting_base),
+                        );
+                    }
+                }
+            }
             let sampled = receive_diagnostics::Capture::checkpoint(&mut diagnostic, &socket, now);
+            if diagnostic.is_none()
+                && let Some(probe) = receiver.fec_reorder.head_probe.take()
+            {
+                probe.finish(now, true);
+            }
             diagnostic
                 .as_mut()
                 .map(|d| d.receive_start(now, sampled, last_ping == now))
@@ -11263,6 +11679,99 @@ mod tests {
             "a healthy completed block must retain the original packet allocation"
         );
         assert_eq!(reorder.blocks.len(), 1, "the successor stays buffered");
+    }
+
+    #[cfg(all(feature = "receive-diagnostics", target_os = "linux"))]
+    #[test]
+    fn fec_head_probe_observes_legacy_renewal_without_changing_recovery() {
+        fn packet(index: u64) -> RtpPacket {
+            let mut plaintext = vec![0_u8; RTP_FIXED_HEADER_LEN];
+            plaintext[0] = 0x80;
+            plaintext[1] = 96;
+            plaintext[2..4].copy_from_slice(&(index as u16).to_be_bytes());
+            plaintext[8..12].copy_from_slice(&1_u32.to_be_bytes());
+            RtpPacket {
+                index,
+                header: RtpHeader::parse(&plaintext).unwrap(),
+                plaintext,
+                origin: RtpPacketOrigin::Authenticated,
+            }
+        }
+        fn layout(block_index: u8, shard_index: usize) -> FecPacketLayout {
+            FecPacketLayout {
+                frame_index: 7,
+                block_index,
+                last_block_index: 2,
+                shard_index,
+                data_shards: if block_index == 0 { 4 } else { 2 },
+                parity_shards: 1,
+            }
+        }
+        let started = Instant::now();
+        let mut reorder = FecReorderBuffer::new(48);
+        reorder.head_probe = Some(fec_reorder_diagnostics::Probe::new(
+            started,
+            std::path::PathBuf::from("/unused/fec-head.json"),
+            None,
+        ));
+        reorder.push(packet(100), layout(0, 0), started);
+        reorder.push(
+            packet(105),
+            layout(1, 0),
+            started + Duration::from_millis(1),
+        );
+        reorder.push(
+            packet(106),
+            layout(1, 1),
+            started + Duration::from_millis(2),
+        );
+        let advanced = reorder.push(
+            packet(101),
+            layout(0, 1),
+            started + Duration::from_millis(40),
+        );
+        assert_eq!(advanced.nack, Some((102, 103)));
+        assert!(advanced.ready.is_empty());
+        let retained = reorder.push(
+            packet(103),
+            layout(0, 3),
+            started + Duration::from_millis(80),
+        );
+        assert!(
+            retained.recovery.is_none(),
+            "diagnostics must preserve the legacy renewed wait"
+        );
+        assert!(retained.ready.is_empty());
+        let expired = reorder.push(
+            packet(108),
+            layout(2, 0),
+            started + Duration::from_millis(92),
+        );
+        assert_eq!(
+            expired.recovery,
+            Some(NvstRecovery::PacketGap {
+                first_missing_index: 102,
+                last_missing_index: 102,
+            })
+        );
+        assert_eq!(
+            expired
+                .ready
+                .iter()
+                .map(|packet| packet.index)
+                .collect::<Vec<_>>(),
+            [105, 106]
+        );
+        let probe = reorder.head_probe.as_ref().unwrap();
+        assert_eq!(probe.current_base(), None);
+        let episodes = probe.test_episodes();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0]["deadlineRestarts"], 1);
+        assert_eq!(episodes[0]["restartsWithReadySuccessors"], 1);
+        assert_eq!(episodes[0]["maxHeadAgeNs"], 91_000_000);
+        assert_eq!(episodes[0]["outcome"], "expired");
+        // Avoid asynchronous filesystem export from this synthetic ownership test.
+        reorder.head_probe = None;
     }
 
     #[test]

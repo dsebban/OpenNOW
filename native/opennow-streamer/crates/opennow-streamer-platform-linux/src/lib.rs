@@ -22,6 +22,7 @@ mod presentation;
 mod queue;
 #[cfg(target_os = "linux")]
 mod session;
+mod recovery_identity;
 #[cfg(target_os = "linux")]
 mod timing;
 #[cfg(target_os = "linux")]

@@ -403,6 +403,7 @@ impl FfmpegDecoder {
                 .map(|probe| probe.next_attempt(&mut prefix));
             match self.decoder.receive_frame(&mut decoded) {
                 Ok(()) => {
+                    crate::recovery_identity::pts_fallback(decoded.pts(), self.last_timestamp_us);
                     #[cfg(feature = "vulkan")]
                     let received = attempt.as_ref().map(|_| std::time::Instant::now());
                     #[cfg(feature = "vulkan")]

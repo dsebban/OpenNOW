@@ -226,6 +226,16 @@ ApplicationWindow {
             && sequence !== ""
         onActivated: ShellStore.toggleMicrophone()
     }
+    Shortcut {
+        objectName: "streamAntiAfkShortcut"
+        sequence: String(ShellStore.settings.shortcutToggleAntiAfk ?? "Ctrl+Shift+K")
+        context: Qt.ApplicationShortcut
+        autoRepeat: false
+        enabled: window.activeRoute === "stream" && ShellStore.activeSession
+            && ShellStore.streamer && ShellStore.streamer.status === "streaming"
+            && sequence !== ""
+        onActivated: ShellStore.applyStreamShortcutAction("toggle-anti-afk")
+    }
 
     function isGuideShortcut(event) {
         const keyboardModifiers = event.modifiers

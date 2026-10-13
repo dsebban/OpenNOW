@@ -365,6 +365,12 @@ void StreamVideoItem::writeLiveTelemetry()
         }
         if (valid) snapshot.insert(name, histogram);
     }
+    if (stats.contains(QStringLiteral("freshPresentationHistory"))) {
+        snapshot.insert(QStringLiteral("freshPresentationHistory"),
+                        QJsonArray::fromVariantList(stats.value(QStringLiteral("freshPresentationHistory")).toList()));
+        snapshot.insert(QStringLiteral("freshPresentationHistoryOmitted"),
+                        stats.value(QStringLiteral("freshPresentationHistoryOmitted")).toString());
+    }
     QFile file(m_liveTelemetryPath);
     if (QFileInfo(m_liveTelemetryPath).isSymLink()
         || !file.open(QIODevice::WriteOnly | QIODevice::Append)

@@ -1,0 +1,286 @@
+{
+  "sourceCommit": "85c2fec9cc9eac0f2da7d5f3f6cea0c13325b891",
+  "selection": "Git tracked and nonignored untracked files",
+  "files": [
+    {
+      "path": ".cursor/skills/start-gfn-hdr/SKILL.md",
+      "sha256": "f224a0e5379235289f68c9443994eafa0387f52d6152c0b2d0b4cba36ffac419"
+    },
+    {
+      "path": ".cursor/skills/start-gfn-hdr/agents/openai.yaml",
+      "sha256": "f7b443441f11d1a118eab5516dadba08475d89f540995d9d0d68aad5d9cec930"
+    },
+    {
+      "path": ".cursor/skills/start-gfn-hdr/scripts/launch-wayland.py",
+      "sha256": "993e0f419551f8c34116bce5de3b33d1f1582d51748747c8c7849240ada8d063"
+    },
+    {
+      "path": ".cursor/skills/verify-gfn-experiments/SKILL.md",
+      "sha256": "82362144a37d2754021a16f70fa08ed9650c26e25ce64d7e438de89ae539ab50"
+    },
+    {
+      "path": ".cursor/skills/verify-gfn-experiments/features/README.md",
+      "sha256": "b32041aa3d754968cf98a0240bd2ed73256e9b4fc3b749d8efefdc24030eed2a"
+    },
+    {
+      "path": ".cursor/skills/verify-gfn-experiments/features/latency-baseline.md",
+      "sha256": "076fa849c164aeee78c7ea17e30ed4026cbcb83b418bb341995083097cb0d2ee"
+    },
+    {
+      "path": ".cursor/skills/verify-gfn-experiments/features/live-measurement.md",
+      "sha256": "1ca1ee912175fb0212031a2a6ef3ac51ae70d3bf76636272fd1af2fea3445af0"
+    },
+    {
+      "path": ".cursor/skills/verify-gfn-experiments/features/network-comparison.md",
+      "sha256": "b286cf0cf28f516672e50535c6772370934ab03ecb5b0b2a224551dd12fb8026"
+    },
+    {
+      "path": ".cursor/skills/verify-gfn-experiments/features/playback.md",
+      "sha256": "465a128f15226a06c362cbdb13c910115d1a63090fcf53de756c7f7e91d68940"
+    },
+    {
+      "path": ".cursor/skills/verify-gfn-experiments/scripts/doctor.py",
+      "sha256": "05c3d93c009385ee97f6745845fa68f0e6996e5ea92e728f4cf1d495cc9d9afb"
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "da48cbfb32a48abff2c3ba8784477741471220147121882061a227da5ce7ccf7"
+    },
+    {
+      "path": "AGENTS.md",
+      "sha256": "88990e7ff4bc030cd0ba4f63992629536b9a5e4b4dad88321478e4374f7426fe"
+    },
+    {
+      "path": "README.md",
+      "sha256": "c4bfdc6eeb618c07ad82bf7329a9cfbb8b1e2d51332ae313c3fff5e426f7cc0b"
+    },
+    {
+      "path": "references/flint2-custom-firmware.md",
+      "sha256": "9b73b20469e24a6ca5b071132379976ff598bcac685ef9e1d40dcd86d404646f"
+    },
+    {
+      "path": "references/gfn-working-profile.md",
+      "sha256": "d6d32c895a37f0fd6070394330bcaa35a4faf82fe909eca606942a12eff6056a"
+    },
+    {
+      "path": "research/custom-shortcuts.md",
+      "sha256": "b32a786b5a7052ddf5aa22fda8673cb2f80fa42b8a2a5501649252c0693bf1e6"
+    },
+    {
+      "path": "research/devin-resume-20261011.md",
+      "sha256": "f97c85641863b130506b41ac26d14a5d5d9cf09ae5b774f7b5a72be75e506f9d"
+    },
+    {
+      "path": "research/evidence.md",
+      "sha256": "800bdd968acd375e90603a8e1f80e1b64e6dbfc5ea31b7bd998cb6a38c1ab384"
+    },
+    {
+      "path": "research/exa-next-hypotheses.md",
+      "sha256": "adbe0a8de797cdcd4f6415a92ad6a841437e761ae2191de29698bb9ddc9a6d12"
+    },
+    {
+      "path": "research/gpu-review.md",
+      "sha256": "cb5dcd9be0a0e513941d09d31b983ea05e8df38d77a139b2d758c268b729074f"
+    },
+    {
+      "path": "research/headless-region-recipe.md",
+      "sha256": "f56357c1f49fe5735c2cb597d1600e03229af04235ddf7b4ae54ac407bb1a7a1"
+    },
+    {
+      "path": "research/last-night-playback-20261013.md",
+      "sha256": "1cad853141c1f50048d3b05bfabaf41c14b9b188e4faa0d036f37486b9769727"
+    },
+    {
+      "path": "research/latency-20261008.md",
+      "sha256": "7c2d3f0842a0d5330d0bb95f5df2b6a5da20ba2a3f8c305b27c201e8fd81a8be"
+    },
+    {
+      "path": "research/latency-baseline-20261008.md",
+      "sha256": "73816ec562db16925fe81810fb8b2f5a58688789e8ddde22ba75f2d1a234d4c8"
+    },
+    {
+      "path": "research/live-evaluation.md",
+      "sha256": "fa2838cc74763a65ecbc8e9e5801ee463a3d96f6291867b5aff12ae774144e36"
+    },
+    {
+      "path": "research/live-hillclimb.md",
+      "sha256": "1061cc2ca8e3dfd1a1afca662165d237aff3fe0fc41513c1d25bcedb0d74a32f"
+    },
+    {
+      "path": "research/network-hillclimb.md",
+      "sha256": "eb636c6b4ae877432d0ae0a99d2ca84f9e468bd280707f10d5476a03604b73e0"
+    },
+    {
+      "path": "research/ori-long-observation-20261011.md",
+      "sha256": "32508088e907fc3a74d72a9b3e7168bdc0e70e8fc024ab5bcefa3871b93c321c"
+    },
+    {
+      "path": "research/ori-stall-localization-20261012.md",
+      "sha256": "351e06a54a5c50fbd57ce94db22e6da24ba4a8e08c51109e4195be2cb5fbed1b"
+    },
+    {
+      "path": "research/prototype-plan.md",
+      "sha256": "7ecb6e88b6a77de940fc383dbb0bd1eede0af3b4a4bad1fecc15a1e53da16b9a"
+    },
+    {
+      "path": "research/qt-idle-experiment.md",
+      "sha256": "81d81a6eb931c1369598a84577e5cb110e59dfc6db3aecb81d01095af60fff93"
+    },
+    {
+      "path": "research/qt-idle-network.md",
+      "sha256": "285ad44fb834a28aeba4bc0759ff5134f460b74412ff61204e5a57a4a42df9b8"
+    },
+    {
+      "path": "research/qt-update-review.md",
+      "sha256": "9e049624462dae7433165c812efee868b1ba1c66d7684ef9b430442e940d4798"
+    },
+    {
+      "path": "research/ready-wake-experiment.md",
+      "sha256": "31b39819a3e1c85ec9c90d7cfcfb90d37bba5fdb25ad28cad4a2613d1527dbfa"
+    },
+    {
+      "path": "research/refresh-experiment.md",
+      "sha256": "8e00ac15ddf74efa94a74a5611d32929d7639c6fd0ce414d6dc0e64adfa980b2"
+    },
+    {
+      "path": "research/transport-review.md",
+      "sha256": "2e973500a1e4f1406045f98eddd553b0be1d9893514ac1397c33ca243d264a8d"
+    },
+    {
+      "path": "research/validation-skill.md",
+      "sha256": "e7e57061b35fba6808d1467167f377e950c8dfd186922cca3b0c8011c13c0a3a"
+    },
+    {
+      "path": "research/wayland-hdr.md",
+      "sha256": "45e421d62ba30c7af17c244ac0293a8b7eefcdaab1846dac1ec7c399c52d734a"
+    },
+    {
+      "path": "tools/analyze-playback-logs.py",
+      "sha256": "eec70c937ed7f5a97ab1756238892f01a5d5f51e3eeb37c913ee709ea29a1ae6"
+    },
+    {
+      "path": "tools/analyze_pcap.py",
+      "sha256": "34942240e7a964affd244ebd45e5d50c18a206df4a7fa054db533fea0bc96502"
+    },
+    {
+      "path": "tools/archive-trial-logs-tests.py",
+      "sha256": "917f4573f72248f66685a41434a4210abe26165250d5bf03410a2936750255b1"
+    },
+    {
+      "path": "tools/archive-trial-logs.py",
+      "sha256": "fe5801f8e921b31b12542fb2a7aa1d4acc06393f567472c8c4937248ce1b7482"
+    },
+    {
+      "path": "tools/bootstrap-nasm.sh",
+      "sha256": "6e82a5c44a749763f3cc2f101c77bd73534e3adabe9cfce02c35c983dcd04b84"
+    },
+    {
+      "path": "tools/bootstrap-qt.sh",
+      "sha256": "aa504533b54574ea87c5b5be67a66c867e5719fea52b6fa6a64be396ba2f6d60"
+    },
+    {
+      "path": "tools/build-native.sh",
+      "sha256": "6b27685a818485ee67164f9e4a3fd0468ebc69be1ba9755c6a6e91d0db1c9151"
+    },
+    {
+      "path": "tools/check-diagnostics.sh",
+      "sha256": "ea24e7b89603eea12491415f0ffe6ad379123d27da5bf2e415a5d252666d0df6"
+    },
+    {
+      "path": "tools/check-hardware.sh",
+      "sha256": "80c6c293cca37110676685650674e18d5b7aa557a10c00594843ac2532b09bb7"
+    },
+    {
+      "path": "tools/export-research-workspace.py",
+      "sha256": "73220da347d3e8063d445be90e0a94ab9b7a7c755c3e7d72e7581999e0824152"
+    },
+    {
+      "path": "tools/fast-stall-feedback.py",
+      "sha256": "744fddac900f338243721a280996a6664c66b257df7de80caafe4dfb44cab8c1"
+    },
+    {
+      "path": "tools/latency-baseline.py",
+      "sha256": "14940d2185a6e2b07ccc1b5a4dd563cd0ef626f1eb69f7a3779f11e40fcf7f3d"
+    },
+    {
+      "path": "tools/live-network-observer-tests.py",
+      "sha256": "c8eaa6f50e033772d5c1733649755565f1752efe33bce772bd68f0be0e55752a"
+    },
+    {
+      "path": "tools/live-network-observer.py",
+      "sha256": "6eb12ee398498739a0485ea68d8e917967df0d13ef7600521706f8019706b667"
+    },
+    {
+      "path": "tools/live-socket-observer-tests.py",
+      "sha256": "5904b5516122abdc98bafe676e67dc7f91fa2377acee8aa8cb6968bfe0d1181e"
+    },
+    {
+      "path": "tools/live-socket-observer.py",
+      "sha256": "9d28f9893de3ab9e2ca6a72d07001aec68b746cffea5f3324fe9e3d648f88324"
+    },
+    {
+      "path": "tools/live-trial-tests.py",
+      "sha256": "3050074c86f1068417f8f5ef2eeb962d167e83f62ce1b4d1d324cc4bc6bc75db"
+    },
+    {
+      "path": "tools/live-trial.py",
+      "sha256": "f2cd07db4576980d9222e98bd07770858ef979da8b98359ad15679bab9013c7c"
+    },
+    {
+      "path": "tools/observe-link-stalls.py",
+      "sha256": "cfe6d8e18a84ab2bb023c7b8df2ed4352a8bb1a5e63fea74160703a4ec371495"
+    },
+    {
+      "path": "tools/observe-stream.py",
+      "sha256": "457b70d4e22014b1499ffed3e655cc01d3259e8732b0b63e4f2e7b2ea3329b25"
+    },
+    {
+      "path": "tools/pipeline-census.py",
+      "sha256": "6f4d6927fa9f2e50770966d8f5654eeae3e43676f4052aeb6bc1705d91665950"
+    },
+    {
+      "path": "tools/presentation-census-tests.py",
+      "sha256": "fe372d39dc369142877294e25beff970fe7f190e12d73a63c8798168c3ee5068"
+    },
+    {
+      "path": "tools/presentation-census.py",
+      "sha256": "84d434e618002d7b4ceed4440fb290c6188492aec4f6cd4c1479428780788c7b"
+    },
+    {
+      "path": "tools/probe_regions.py",
+      "sha256": "0a3aaf6669a3b95fced66370dce0ca66510733abcb04427eca37be7b518cf02b"
+    },
+    {
+      "path": "tools/probe_vaapi.py",
+      "sha256": "da789c9c97b79974ee5d8c1fa690aa4829a317daaa8ea6e196cc43cd692e56d1"
+    },
+    {
+      "path": "tools/research.sh",
+      "sha256": "fbc54452b152892ebbb385f135126c1ca44be630259db4149fb2de31421ff0d4"
+    },
+    {
+      "path": "tools/run-live-trial.sh",
+      "sha256": "af0534e7fa4b6596f0df0a3eed95288524590ec30dca8be287ada450368737f9"
+    },
+    {
+      "path": "tools/run-native.sh",
+      "sha256": "9280bc0c32d9fa3c7ff01780165e7ef77e1236a1eb86ca0a4ac7281a1a5b5673"
+    },
+    {
+      "path": "tools/set-trial-profile.py",
+      "sha256": "87ce72905422250129cf72534a8ede2bba64503025bf5740bd67da167482037c"
+    },
+    {
+      "path": "tools/stage-log-analysis.py",
+      "sha256": "caf03ad9529e9d6b760a19752c73c28c07189f72d1bffb747e3d9548eaa50f0a"
+    },
+    {
+      "path": "tools/summarize-trial.py",
+      "sha256": "4e557b021557ee307461b623a134ae734dd2192ba7d33bb0f7730cf3b3ad9f21"
+    },
+    {
+      "path": "tools/virtual-gamepad.py",
+      "sha256": "bf79bfc4f33851723ec49808acc708c89200fbdaec54951ef1fd922a4ba529a2"
+    }
+  ]
+}
